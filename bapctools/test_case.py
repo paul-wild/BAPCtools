@@ -1,0 +1,603 @@
+"""Test case"""
+
+import shlex
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, TYPE_CHECKING
+
+from colorama import Fore, Style
+
+from bapctools import bar, config, validate
+from bapctools.util import (
+    combine_hashes_dict,
+    ExecStatus,
+    hash_file_content,
+    parse_yaml,
+    print_name,
+    remove_path,
+    shorten_path,
+    substitute,
+    YamlParser,
+)
+from bapctools.validate import (
+    AnswerValidator,
+    AnyValidator,
+    Constraint,
+    InputValidator,
+    OutputValidator,
+)
+from bapctools.visualize import AnyVisualizer, InputVisualizer, OutputVisualizer
+
+if TYPE_CHECKING:  # Prevent circular import: https://stackoverflow.com/a/39757388
+    from bapctools.problem import Problem
+
+
+class TestGroup:
+    def __init__(
+        self,
+        problem: "Problem",
+        file: Optional[Path],
+        yaml_data: object,
+        parent: Optional["TestGroup"],
+    ) -> None:
+        if parent is None:
+            self.args: Sequence[str] = []
+            self.answer_validator_args: Sequence[str] | Mapping[str, Sequence[str]] = []
+            self.input_visualizer_args: Sequence[str] = []
+            self.input_validator_args: Sequence[str] | Mapping[str, Sequence[str]] = []
+            self.output_visualizer_args: Sequence[str] = []
+            self.output_validator_args: Sequence[str] = []
+
+            # not implemented:
+            # self.full_feedback: bool
+            # self.hint: str
+            # self.description: str
+            # self.max_score: int | "unbounded"
+            # self.score_aggregation: "pass-fail" | "sum" | "min"
+            # self.static_validation_score: int | "pass-fail"
+            # self.require_pass: str | Sequence[str]
+        else:
+            for key, value in vars(parent).items():
+                setattr(self, key, value)
+
+        self.file = file
+
+        if not isinstance(yaml_data, dict):
+            bar.error(f"could not parse {file}. SKIPPED.")
+            return
+
+        parser = YamlParser(yaml_data)
+
+        # parse deprecated keys
+        parser.extract_deprecated("output_validator_flags", OutputValidator.args_key)
+        parser.extract_deprecated("input_validator_flags", InputValidator.args_key)
+
+        # parse args
+        for key in [
+            "args",
+            InputVisualizer.args_key,
+            OutputVisualizer.args_key,
+            OutputValidator.args_key,
+        ]:
+            if key in parser.remaining:
+                setattr(
+                    self,
+                    key,
+                    parser.extract_optional_list(key, str, allow_value=False, allow_empty=True),
+                )
+
+        for validator_type in [
+            AnswerValidator,
+            InputValidator,
+        ]:
+            assert isinstance(validator_type, (type(AnswerValidator), type(InputValidator)))
+            key = validator_type.args_key
+            source_dir = validator_type.source_dir
+            if key in parser.remaining:
+                if isinstance(parser.remaining[key], list):
+                    setattr(
+                        self,
+                        key,
+                        parser.extract_optional_list(key, str, allow_value=False, allow_empty=True),
+                    )
+                elif isinstance(parser.remaining[key], dict):
+                    # only the hole dict is inherited not individual entries
+                    args_parser = parser.extract_parser(key)
+                    args = {}
+                    for val in (problem.path / source_dir).iterdir():
+                        if val.name not in args_parser.remaining:
+                            continue
+                        args[val.name] = args_parser.extract_optional_list(
+                            val.name,
+                            str,
+                            allow_value=False,
+                            allow_empty=True,
+                        )
+                    setattr(self, key, args)
+                    args_parser.check_unknown_keys()
+                elif parser.remaining[key] is None:
+                    parser.pop(key)
+                    setattr(self, key, [])
+                else:
+                    parser.pop(key)
+                    bar.warn(f"incompatible value for key `{key}`. SKIPPED.")
+
+        # parse keys not currently used
+        parser.extract_optional("full_feedback", bool)
+        parser.extract_optional("hint", str)
+        parser.extract_optional("description", str)
+
+        # check test group only keys
+        if file is None or not file.with_suffix(".in").is_file():
+            for key in ["max_score", "score_aggregation", "static_validation_score"]:
+                if parser.pop(key) is not None:
+                    bar.error(f"key `{key}` not supported by BAPCtools. SKIPPED.")
+
+        parser.check_unknown_keys()
+
+    def get_args(self, program: AnyValidator | AnyVisualizer) -> Sequence[str]:
+        assert hasattr(self, type(program).args_key)
+        args = getattr(self, type(program).args_key)
+        if isinstance(args, dict):
+            args = args.get(program.name, [])
+        assert isinstance(args, list)
+        return args
+
+    @staticmethod
+    def parse_yaml(
+        problem: "Problem",
+        file: Path,
+        parent: "TestGroup",
+        *,
+        filename: Optional[Path] = None,
+    ) -> "TestGroup":
+        assert file.is_file()
+
+        # substitute constants
+        raw = substitute(
+            file.read_text(),
+            problem.settings.constants,
+            pattern=config.CONSTANT_SUBSTITUTE_REGEX,
+        )
+        yaml_data = parse_yaml(raw, path=filename or file)
+        return TestGroup(problem, filename or file, yaml_data, parent)
+
+
+@dataclass(frozen=True)
+class TestCaseOverrides:
+    name: str
+    # A single path represents a .interaction file. A tuple contains (.in, .ans)
+    statement: tuple[Path, Path] | Path
+    download: tuple[Path, Path]
+
+
+class TestCase:
+    """
+    A single test case. It consists of files with matching base names, typically
+
+    * an input file, sometimes called "the input", with extension `.in`, such as `petersen.in`
+    * a default answer file, sometimes called "the answer", with extension `.ans`, such as `petersen.ans`
+
+    Test cases in `data/invalid_input` consist only of an input file. Test cases in `data/valid_output`
+    or `data/invalid_output` additionally consist of an output file, with extension `.out`.
+
+    As a rule of thumb, test cases have different inputs. To be precise, test cases in
+    the same directory must have different inputs, except for test cases below `invalid_answer`,
+    `invalid_output`, and `valid_output`. Moreover, test cases in different directories with
+    the same base name, such as `sample/petersen` and `secret/cubic/petersen`, may have identical inputs;
+    this commonly happens when the first test case was included from `sample` into `secret/cubic`.
+
+    Attributes
+    ----------
+
+    problem: Problem
+        The underlying problem that this test case belongs to.
+
+    name: str
+        The name of this test case, relative to `data`, like `secret/cubic/petersen`.
+
+    root: str
+        The name of the topmost directory below `data` containing this test case, like `secret` or `invalid_input`.
+
+    short_path: Path
+        The path to the input of this test case, relative to `data`, like `secret/cubic/petersen.in`.
+
+    in_path: Path
+        Like `hamiltonicity/data/secret/cubic/petersen.in`.
+
+    ans_path: Path
+        Like `hamiltonicity/data/secret/cubic/petersen.ans`.
+
+    out_path: Path
+        Like `hamiltonicity/data/secret/cubic/petersen.out`.
+
+    """
+
+    def __init__(
+        self,
+        base_problem: "Problem",
+        path: Path,
+        *,
+        short_path: Optional[Path] = None,
+    ):
+        """
+        Arguments
+        ---------
+        path: Path
+            The path to the test case's input file, like `data/secret/cubic/petersen.in`
+
+        short_path: Path
+            Test cases outside problem/data must pass in the short_path explicitly.  In that case, `path`
+            is the (absolute) path to the input file, and `short_path` is used as the equivalent of the test case's
+            path relative to  `problem.path / 'data'`.
+        """
+        assert path.suffix == ".in"
+
+        self.problem = base_problem
+
+        if short_path is None:
+            try:
+                self.short_path: Path = path.relative_to(self.problem.path / "data")
+            except ValueError:
+                bar.fatal(f"Test case {path} is not inside {self.problem.path / 'data'}.")
+        else:
+            self.short_path = short_path
+
+        self.root: str = self.short_path.parts[0]
+
+        self.in_path: Path = path
+        self.ans_path: Path = self.in_path.with_suffix(".ans")
+        self.out_path: Optional[Path] = (
+            self.in_path.with_suffix(".out")
+            if self.root in ["valid_output", "invalid_output"]
+            or self.in_path.with_suffix(".out").is_file()
+            else None
+        )
+
+        # Display name: everything after data/.
+        self.name: str = self.short_path.with_suffix("").as_posix()
+        # cache for test_case.yaml
+        self._test_case_yaml: Optional[TestGroup] = None
+
+    def __repr__(self) -> str:
+        return self.name
+
+    def with_suffix(self, ext: str) -> Path:
+        return self.in_path.with_suffix(ext)
+
+    def get_test_case_yaml(self) -> TestGroup:
+        assert self.in_path.is_file()
+
+        if self._test_case_yaml is not None:
+            return self._test_case_yaml
+
+        yaml_path = self.problem.path / "data" / self.short_path.with_suffix(".yaml")
+        test_group_yaml = self.problem.get_test_group_yaml(yaml_path.parent)
+
+        yaml_file = self.with_suffix(".yaml")
+        if yaml_file.is_file():
+            self._test_case_yaml = TestGroup.parse_yaml(
+                self.problem, yaml_file, test_group_yaml, filename=yaml_path
+            )
+        else:
+            self._test_case_yaml = test_group_yaml
+        return self._test_case_yaml
+
+    # Returns a hash of the core part of the test case (the part that is usually supposed to be unique)
+    def core_hash(self) -> str:
+        # Store the hashes of the generated files for this test case
+        hashes = {}
+
+        # consider specific files for the core of this test case
+        relevant_files = {
+            "invalid_input": [".in"],
+            "invalid_answer": [".in", ".ans"],
+            "invalid_output": [".in", ".ans", ".out"],
+            "valid_output": [".in", ".ans", ".out"],
+        }
+        relevant_files_default = [".in"] if self.problem.settings.ans_is_output else [".in", ".ans"]
+        extensions = relevant_files.get(self.root, relevant_files_default)
+
+        for ext in extensions:
+            file = self.with_suffix(ext)
+            if file.is_file():
+                hashes[ext] = hash_file_content(file)
+
+        # always consider args and output_validator_args
+        test_case_yaml = self.get_test_case_yaml()
+        hashes["sumission_args"] = shlex.join(test_case_yaml.args)
+        hashes["output_validator_args"] = shlex.join(test_case_yaml.output_validator_args)
+
+        return combine_hashes_dict(hashes)
+
+    def validator_hashes(self, cls: type[AnyValidator]) -> dict[str, dict[str, str]]:
+        """
+        Returns
+        -------
+        a dict of objects
+             hash =>
+             - name
+             - flags
+        indicating which validators will be run for this test case.
+        """
+        assert cls in [InputValidator, AnswerValidator, OutputValidator]
+        validators = self.problem.validators(cls)
+
+        d = {}
+
+        for validator in validators:
+            flags = self.get_test_case_yaml().get_args(validator)
+            flags_string = " ".join(flags)
+            h = combine_hashes_dict(
+                {
+                    "name": validator.name,
+                    "flags": flags_string,
+                    "hash": validator.hash,
+                }
+            )
+            d[h] = {
+                "name": validator.name,
+                "flags": flags_string,
+            }
+
+        return d
+
+    def validate_format(
+        self,
+        mode: validate.Mode,
+        *,
+        constraints: Optional[dict[str, Constraint]] = None,
+        warn_instead_of_error: bool = False,
+    ) -> bool:
+        check_constraints = constraints is not None
+
+        match mode:
+            case validate.Mode.INPUT:
+                return self._run_validators(
+                    validate.Mode.INPUT,
+                    self.problem.validators(InputValidator, check_constraints=check_constraints),
+                    expect_rejection=self.root == "invalid_input",
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+            case validate.Mode.ANSWER:
+                return self._run_validators(
+                    validate.Mode.ANSWER,
+                    self.problem.validators(AnswerValidator, check_constraints=check_constraints),
+                    expect_rejection=self.root == "invalid_answer",
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+            case validate.Mode.INVALID:
+                assert self.root in config.INVALID_CASE_DIRECTORIES
+
+                ok = self.validate_format(
+                    validate.Mode.INPUT,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+                if not ok or self.root == "invalid_input":
+                    return ok
+
+                assert not self.problem.interactive
+
+                ok = self.validate_format(
+                    validate.Mode.ANSWER,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+                if not ok or self.root == "invalid_answer":
+                    return ok
+
+                assert not self.problem.multi_pass
+
+                return self._run_validators(
+                    validate.Mode.INVALID,
+                    self.problem.validators(OutputValidator),
+                    expect_rejection=True,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+            case validate.Mode.VALID_OUTPUT:
+                assert not self.problem.interactive
+                assert not self.problem.multi_pass
+
+                ok = self.validate_format(
+                    validate.Mode.INPUT,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+                if not ok:
+                    return ok
+
+                ok = self.validate_format(
+                    validate.Mode.ANSWER,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+                if not ok:
+                    return ok
+
+                return self._run_validators(
+                    validate.Mode.VALID_OUTPUT,
+                    self.problem.validators(OutputValidator),
+                    expect_rejection=False,
+                    constraints=constraints,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+            case _:
+                raise ValueError
+
+    def _run_validators(
+        self,
+        mode: validate.Mode,
+        validators: Sequence[AnyValidator],
+        *,
+        expect_rejection: bool,
+        constraints: Optional[dict[str, Constraint]] = None,
+        warn_instead_of_error: bool = False,
+    ) -> bool:
+        results = []
+        output_validator_crash_unexpected = False
+        for validator in validators:
+            name = validator.name
+            args = []
+            if isinstance(validator, OutputValidator) and mode == validate.Mode.ANSWER:
+                args += ["case_sensitive", "space_change_sensitive"]
+                name = f"{name} (ans)"
+            args = [*args, *self.get_test_case_yaml().get_args(validator)]
+
+            ret = validator.run(self, mode=mode, constraints=constraints, args=args)
+            results.append(ret.status)
+
+            message = name
+            if args:
+                message += " [" + ", ".join(args) + "]"
+            message += ": "
+            if ret.status:
+                message += "accepted"
+            elif ret.status == ExecStatus.TIMEOUT:
+                message += "timeout"
+            elif ret.status == ExecStatus.REJECTED:
+                message += "rejected"
+            else:
+                message += "crashed"
+
+            # Print stdout and stderr whenever something is printed
+            data = ""
+            if not (ret.status or expect_rejection) or config.args.error:
+                if ret.err and ret.out:
+                    data = (
+                        ret.err
+                        + f"\n{Fore.RED}VALIDATOR STDOUT{Style.RESET_ALL}\n"
+                        + Fore.YELLOW
+                        + ret.out
+                    )
+                elif ret.err:
+                    data = ret.err
+                elif ret.out:
+                    data = ret.out
+
+                if mode == validate.Mode.INPUT:
+                    file = self.in_path
+                elif mode == validate.Mode.ANSWER:
+                    file = self.ans_path
+                elif mode in [validate.Mode.INVALID, validate.Mode.VALID_OUTPUT]:
+                    assert self.out_path is not None
+                    file = self.out_path
+                else:
+                    assert False
+
+                data += (
+                    f"{Style.RESET_ALL}-> {shorten_path(self.problem, file.parent) / file.name}\n"
+                )
+            elif ret.err:
+                data = ret.err
+
+            if expect_rejection:
+                warn = False
+                if (
+                    isinstance(validator, OutputValidator)
+                    and ret.status == ExecStatus.ERROR
+                    and mode != validate.Mode.ANSWER
+                ):
+                    output_validator_crash_unexpected = True
+                    warn = True
+                elif ret.status == ExecStatus.TIMEOUT:
+                    warn = True
+
+                if warn:
+                    bar.part_done(
+                        False,
+                        message,
+                        data=data,
+                        warn_instead_of_error=warn_instead_of_error,
+                    )
+                else:
+                    color = Fore.GREEN if ret.status == ExecStatus.REJECTED else Fore.YELLOW
+                    bar.verbose(
+                        message,
+                        data=data,
+                        color=color,
+                    )
+            elif ret.status == ExecStatus.ERROR and ret.returncode == 0:
+                bar.part_done(
+                    False,
+                    message,
+                    data="Exit code 0, did you forget to exit with WA or AC?",
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+            else:
+                bar.part_done(
+                    bool(ret.status),
+                    message,
+                    data=data,
+                    warn_instead_of_error=warn_instead_of_error,
+                )
+
+            if (
+                ret.status
+                or expect_rejection
+                or self.root in [*config.INVALID_CASE_DIRECTORIES, "valid_output"]
+            ):
+                continue
+
+            # Move test case to destination directory if specified.
+            if config.args.move_to:
+                infile = self.in_path
+                targetdir = self.problem.path / config.args.move_to
+                targetdir.mkdir(parents=True, exist_ok=True)
+                intarget = targetdir / infile.name
+                infile.rename(intarget)
+                bar.log(f"Moved to {print_name(intarget)}")
+                ansfile = self.ans_path
+                if ansfile.is_file():
+                    anstarget = intarget.with_suffix(".ans")
+                    ansfile.rename(anstarget)
+                    bar.log(f"Moved to {print_name(anstarget)}")
+
+            # Remove test case if specified.
+            elif mode == validate.Mode.INPUT and config.args.remove:
+                bar.log(f"{Fore.RED}REMOVING TESTCASE!{Style.RESET_ALL}")
+                remove_path(self.in_path)
+                remove_path(self.ans_path)
+
+            break
+
+        if expect_rejection:
+            issues = []
+            if all(results):
+                issues.append("All validators accepted.")
+            elif ExecStatus.REJECTED not in results:
+                issues.append(f"At least one validator must exit with {config.RTV_WA}.")
+            elif ExecStatus.TIMEOUT in results:
+                issues.append("Validator timed out.")
+            if output_validator_crash_unexpected:
+                issues.append("Output Validator crashed.")
+
+            success = not issues
+            if not success:
+                msg = f"was not properly rejected by {mode} validation. {' '.join(issues)}"
+                if warn_instead_of_error:
+                    bar.warn(msg)
+                else:
+                    bar.error(msg)
+        else:
+            success = all(results)
+            if success:
+                main_path: Optional[Path] = None
+                if mode == validate.Mode.INPUT:
+                    main_path = self.in_path
+                elif mode == validate.Mode.ANSWER:
+                    main_path = self.ans_path
+                elif mode == validate.Mode.VALID_OUTPUT and self.root not in [
+                    "valid_output",
+                    "invalid_output",
+                ]:
+                    main_path = self.out_path
+
+                if main_path is not None:
+                    validate.sanity_check(self.problem, main_path)
+
+        return success

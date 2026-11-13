@@ -1,0 +1,1160 @@
+# read problem settings from config files
+
+import difflib
+import errno
+import functools
+import hashlib
+import importlib.util
+import inspect
+import os
+import re
+import secrets
+import shutil
+import string
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import ExitStack, suppress
+from dataclasses import dataclass
+from enum import Enum
+from io import StringIO
+from pathlib import Path
+from typing import (
+    Any,
+    BinaryIO,
+    cast,
+    Concatenate,
+    Generic,
+    Literal,
+    Optional,
+    overload,
+    ParamSpec,
+    TYPE_CHECKING,
+    TypeGuard,
+    TypeVar,
+)
+from uuid import UUID
+
+from colorama import Fore, Style
+from ruamel.yaml import YAML
+from ruamel.yaml.comments import CommentedMap, CommentedSeq
+from ruamel.yaml.constructor import DuplicateKeyError, RoundTripConstructor
+from ruamel.yaml.nodes import ScalarNode
+
+from bapctools import bar, config
+from bapctools.bar import crop_output
+
+if TYPE_CHECKING:  # Prevent circular import: https://stackoverflow.com/a/39757388
+    from bapctools.problem import Problem
+    from bapctools.verdicts import Verdict
+
+# we delay this import since it is quite time consuming
+# lazy import questionary
+use_questionary = importlib.util.find_spec("questionary") is not None
+
+
+def is_windows() -> bool:
+    return sys.platform in ["win32", "cygwin"]
+
+
+def is_mac() -> bool:
+    return sys.platform in ["darwin"]
+
+
+def is_freebsd() -> bool:
+    return "freebsd" in sys.platform
+
+
+def is_aquabsd() -> bool:
+    return "aquabsd" in sys.platform
+
+
+def is_bsd() -> bool:
+    return is_mac() or is_freebsd() or is_aquabsd()
+
+
+if not is_windows():
+    import resource
+
+
+R = TypeVar("R")
+
+
+class OnceWrapper(Generic[R]):
+    def __init__(self, function: Callable[[], R]):
+        self._function = function
+        self._lock = threading.Lock()
+        self._done = False
+        self._result: Optional[R] = None
+        functools.wraps(function)(self)
+
+    def __call__(self) -> R:
+        with self._lock:
+            if not self._done:
+                self._result = self._function()
+                self._done = True
+            return cast("R", self._result)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._done = False
+            self._result = None
+
+
+def once(function: Callable[[], R]) -> OnceWrapper[R]:
+    """This decorator ensures that a function is executed at most once (this is thread safe)"""
+    return OnceWrapper(function)
+
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+
+def once_per_instance(method: Callable[Concatenate[T, P], R]) -> Callable[Concatenate[T, P], R]:
+    """
+    This decorator ensures that a instance method is executed at most once.
+    This is **not** threadsafe!
+    """
+    cache_name = f"__cache_{method.__name__}"
+    signature = inspect.signature(method)
+    instance_parameter = next(iter(signature.parameters))
+
+    @functools.wraps(method)
+    def wrapped(self: T, *args: P.args, **kwargs: P.kwargs) -> R:
+        if not hasattr(self, cache_name):
+            setattr(self, cache_name, {})
+        cache: dict[object, R] = getattr(self, cache_name)
+
+        bound = signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        key = tuple(
+            (name, value) for name, value in bound.arguments.items() if name != instance_parameter
+        )
+        if key not in cache:
+            assert threading.current_thread() is threading.main_thread()
+            cache[key] = method(self, *args, **kwargs)
+        return cache[key]
+
+    return cast("Callable[Concatenate[T, P], R]", wrapped)
+
+
+@once
+def home_config_dir() -> Path:
+    if is_windows():
+        home_dir = Path(os.getenv("APPDATA", Path.home()))
+    elif is_mac():
+        home_dir = Path.home() / "Library" / "Application Support"
+    else:
+        home_dir = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return home_dir.resolve() / "bapctools"
+
+
+@once
+def get_cwd_tmpdir() -> Path:
+    # We create one tmpdir per contest.
+    h = hashlib.sha256(bytes(Path.cwd())).hexdigest()[-6:]
+    tmpdir = (Path(tempfile.gettempdir()) / f"bapctools_{h}").resolve()
+    tmpdir.mkdir(parents=True, exist_ok=True)
+    return tmpdir
+
+
+# Drops the first two path components <problem>/<type>/
+def print_name(path: Path, *, keep_type: bool = False) -> str:
+    return str(Path(*path.parts[1 if keep_type else 2 :]))
+
+
+# A path is a problem directory if it contains a `problem.yaml` file.
+def is_problem_directory(path: Path) -> bool:
+    return (path / "problem.yaml").is_file()
+
+
+def get_basedirs(problem: "Problem", type: str | Path) -> list[Path]:
+    p = problem.path
+    return [p / type, p, p.parent, config.current_working_directory]
+
+
+# Given a command line argument, return the first match:
+# - absolute
+# - relative to the 'type' directory for the current problem
+# - relative to the problem directory
+# - relative to the contest directory
+# - relative to the current working directory
+#
+# Pass suffixes = ['.in'] to also try to find the file with the given suffix appended.
+def resolve_path_argument(
+    problem: "Problem", path: Path, type: str | Path, suffixes: Sequence[str] = tuple()
+) -> Optional[Path]:
+    basedirs = [Path()] if path.is_absolute() else get_basedirs(problem, type)
+    for suffix in [*suffixes, None]:
+        suffixed_path = path if suffix is None else path.with_suffix(suffix)
+        for basedir in basedirs:
+            p = basedir / suffixed_path
+            if p.exists():
+                return p
+    bar.warn(f"{path} not found")
+    return None
+
+
+# creates a shortened path to some file/dir in the tmpdir.
+# If the provided path does not point to the tmpdir it is returned as is.
+# The path is of the form "tmp/<contest_tmpdir>/<problem_tmpdir>/links/<hash>"
+def shorten_path(problem: "Problem", path: Path) -> Path:
+    if not path.resolve().is_relative_to(problem.tmpdir):
+        return path
+    short_hash = hashlib.sha256(bytes(path)).hexdigest()[-6:]
+    dir = problem.tmpdir / "links"
+    dir.mkdir(parents=True, exist_ok=True)
+    short_path = dir / short_hash
+    ensure_symlink(short_path, path)
+    return short_path
+
+
+def path_size(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    else:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.exists())
+
+
+def drop_suffix(path: Path, suffixes: Sequence[str]) -> Path:
+    for suffix in suffixes:
+        assert suffix.startswith(".")
+        if path.name.endswith(suffix):
+            return path.with_name(path.name.removesuffix(suffix))
+    return path
+
+
+# safer function to remove a path, handles files, dirs and broken symlinks
+def remove_path(path: Path) -> None:
+    with suppress(NotADirectoryError, FileNotFoundError):
+        try:
+            path.unlink()
+        except OSError:
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                raise
+
+
+class DateAwareYamlConstructor(RoundTripConstructor):
+    def construct_yaml_timestamp(self, node: ScalarNode, values: Any = None) -> Any:
+        # if something looks like a date (XXXX-XX-XX) but is not a valid
+        # date (like 2025-02-30) we should not parse it as a date
+        # If we use a YamlParser we will raise a type error later on
+        try:
+            return super().construct_yaml_timestamp(node, values)
+        except ValueError:
+            return self.construct_scalar(node)
+
+    yaml_constructors = RoundTripConstructor.yaml_constructors.copy()
+    yaml_constructors["tag:yaml.org,2002:timestamp"] = construct_yaml_timestamp
+
+
+def _ryaml() -> YAML:
+    ryaml = YAML(typ="rt")
+    ryaml.Constructor = DateAwareYamlConstructor
+    ryaml.default_flow_style = False
+    ryaml.indent(mapping=2, sequence=4, offset=2)
+    ryaml.width = sys.maxsize
+    ryaml.preserve_quotes = True
+    return ryaml
+
+
+def parse_yaml(data: str, path: Optional[Path] = None, *, suppress_errors: bool = False) -> object:
+    try:
+        return _ryaml().load(data)
+    except DuplicateKeyError as e:
+        if suppress_errors:
+            return None
+        source = "object" if path is None else f"file {path}"
+        bar.fatal(f"Duplicate key in yaml {source}!\n{e.args[0]}\n{e.args[2]}")
+    except Exception as e:
+        if suppress_errors:
+            return None
+        bar.eprint(f"{Fore.YELLOW}{e}{Style.RESET_ALL}")
+        source = "object" if path is None else f"file {path}"
+        bar.fatal(f"Failed to parse yaml {source}.")
+
+
+def read_yaml(
+    path: Path, *, empty: Optional[object] = None, suppress_errors: bool = False
+) -> object:
+    assert suppress_errors is False or empty is None, "cannot use `empty` with suppress_errors"
+    try:
+        ret = parse_yaml(path.read_text(), path=path, suppress_errors=suppress_errors)
+    except Exception as e:
+        if suppress_errors:
+            ret = None
+        elif empty is not None and isinstance(e, FileNotFoundError):
+            ret = None
+        else:
+            bar.eprint(f"{Fore.YELLOW}{e}{Style.RESET_ALL}")
+            bar.fatal(f"Failed to parse yaml file {path}.")
+    return empty if ret is None else ret
+
+
+def yaml_isinstance(value: object, t: type[T]) -> TypeGuard[T]:
+    """same as isinstance(value, t) except that True and False are not considered int's"""
+    if not isinstance(value, t):
+        return False
+    if isinstance(value, bool) and t is int:
+        return False
+    return True
+
+
+def normalize_yaml_value(value: object, t: type[object]) -> object:
+    if yaml_isinstance(value, int) and t is float:
+        return float(value)
+    return value
+
+
+class YamlParser:
+    def __init__(self, yaml: dict[object, object], parent_path: Optional[str] = None):
+        assert isinstance(yaml, dict)
+        self.errors = 0
+        self.remaining = dict(yaml)
+        self.known_keys = set[str]()
+        self.parent_path = parent_path
+        self.parent_str = "root" if parent_path is None else f"`{parent_path}`"
+
+    def _key_path(self, key: str) -> str:
+        return key if self.parent_path is None else f"{self.parent_path}.{key}"
+
+    def check_unknown_keys(self, *, warn: bool = True) -> None:
+        func = bar.warn if warn else bar.log
+        for key in self.remaining:
+            if not yaml_isinstance(key, str):
+                func(f"invalid key: `{key}` in {self.parent_str}. SKIPPED.")
+            else:
+                closest = difflib.get_close_matches(key, self.known_keys, n=1)
+                hint = f". Did you mean: {closest[0]}?" if closest else ""
+                func(f"found unknown key: {key} in {self.parent_str}{hint}")
+
+    def pop(self, key: str) -> object:
+        self.known_keys.add(key)
+        return self.remaining.pop(key, None)
+
+    def extract_optional(self, key: str, t: type[T]) -> Optional[T]:
+        self.known_keys.add(key)
+        if key in self.remaining:
+            value = normalize_yaml_value(self.remaining.pop(key), t)
+            if value is None or yaml_isinstance(value, t):
+                return value
+            bar.warn(f"incompatible value for key `{self._key_path(key)}`. SKIPPED.")
+        return None
+
+    def extract(self, key: str, default: T, constraint: Optional[str] = None) -> T:
+        self.known_keys.add(key)
+        value = self.extract_optional(key, type(default))
+        result = default if value is None else value
+        if constraint:
+            assert isinstance(result, (float, int))
+            assert eval(f"{default} {constraint}")
+            if not eval(f"{result} {constraint}"):
+                bar.warn(
+                    f"value for `{self._key_path(key)}` should be {constraint} but is {result}. SKIPPED."
+                )
+                return default
+        return result
+
+    def extract_and_error(self, key: str, t: type[T]) -> T:
+        self.known_keys.add(key)
+        if key in self.remaining:
+            value = normalize_yaml_value(self.remaining.pop(key), t)
+            if yaml_isinstance(value, t):
+                return value
+            bar.error(f"incompatible value for key '{key}'.")
+        else:
+            bar.error(f"missing key `{self._key_path(key)}`.")
+        self.errors += 1
+        return t()
+
+    def extract_deprecated(self, key: str, new: Optional[str] = None) -> None:
+        # do not add this as known_key, it is deprecated
+        if key in self.remaining:
+            use = f", use `{new}` instead" if new else ""
+            bar.warn(f"key `{self._key_path(key)}` is deprecated{use}. SKIPPED.")
+            self.remaining.pop(key)
+
+    def extract_reserved(self, key: str) -> None:
+        # do not add this as known_key, it is reserved
+        if key in self.remaining:
+            bar.warn(f"key `{self._key_path(key)}` is reserved. SKIPPED.")
+            self.remaining.pop(key)
+
+    def extract_optional_list(
+        self, key: str, t: type[T], *, allow_value: bool = True, allow_empty: bool = False
+    ) -> list[T]:
+        self.known_keys.add(key)
+        if key in self.remaining:
+            value = self.remaining.pop(key)
+            if value is None:
+                return []
+            if allow_value and yaml_isinstance(value, t) and not yaml_isinstance(value, list):
+                return [value]
+            if yaml_isinstance(value, list):
+                if not all(yaml_isinstance(v, t) for v in value):
+                    bar.warn(
+                        f"some values for key `{self._key_path(key)}` do not have type {t.__name__}. SKIPPED."
+                    )
+                    return []
+                if not value and not allow_empty:
+                    bar.warn(f"value for `{self._key_path(key)}` should not be an empty list.")
+                return value
+            bar.warn(f"incompatible value for key `{self._key_path(key)}`. SKIPPED.")
+        return []
+
+    def extract_parser(self, key: str) -> "YamlParser":
+        self.known_keys.add(key)
+        return YamlParser(self.extract(key, {}), self._key_path(key))
+
+
+@overload
+def ryaml_get_or_add(yaml: CommentedMap, key: str) -> CommentedMap: ...
+@overload
+def ryaml_get_or_add(yaml: CommentedMap, key: str, t: type[CommentedSeq]) -> CommentedSeq: ...
+def ryaml_get_or_add(
+    yaml: CommentedMap,
+    key: str,
+    t: type[CommentedMap] | type[CommentedSeq] = CommentedMap,
+) -> CommentedMap | CommentedSeq:
+    assert isinstance(yaml, CommentedMap)
+    if key not in yaml or yaml[key] is None:
+        yaml[key] = t()
+    value = yaml[key]
+    assert isinstance(value, t)
+    return value  # type: ignore[no-any-return]
+
+
+# This tries to preserve the correct comments.
+def ryaml_filter(data: CommentedMap, remove: str) -> object:
+    assert isinstance(data, CommentedMap)
+    remove_index = list(data.keys()).index(remove)
+    if remove_index == 0:
+        return data.pop(remove)
+
+    curr = data
+    prev_key = list(data.keys())[remove_index - 1]
+    while isinstance(curr[prev_key], (CommentedSeq, CommentedMap)) and len(curr[prev_key]):
+        # Try to remove the comment from the last element in the preceding list/dict
+        curr = curr[prev_key]
+        if isinstance(curr, list):
+            prev_key = len(curr) - 1
+        else:
+            prev_key = list(curr.keys())[-1]
+
+    if remove in data.ca.items:
+        # Move the comment that belongs to the removed key (which comes _after_ the removed key)
+        # to the preceding key
+        curr.ca.items[prev_key] = data.ca.items.pop(remove)
+    elif prev_key in curr.ca.items:
+        # If the removed key does not have a comment,
+        # the comment after the previous key should be removed
+        curr.ca.items.pop(prev_key)
+
+    return data.pop(remove)
+
+
+# Insert a new key before an old key, then remove the old key.
+# If new_value is not given, the default is to simply rename the old key to the new key.
+def ryaml_replace(
+    data: CommentedMap,
+    old_key: str,
+    new_key: str,
+    new_value: object = None,
+) -> None:
+    assert isinstance(data, CommentedMap)
+    if new_value is None:
+        new_value = data[old_key]
+    data.insert(list(data.keys()).index(old_key), new_key, new_value)
+    data.pop(old_key)
+    if old_key in data.ca.items:
+        data.ca.items[new_key] = data.ca.items.pop(old_key)
+
+
+# The @overload definitions are purely here for static typing reasons.
+@overload
+def write_yaml(data: object) -> str: ...
+@overload
+def write_yaml(data: object, path: Path) -> None: ...
+def write_yaml(data: object, path: Optional[Path] = None) -> Optional[str]:
+    _path = StringIO() if path is None else path
+    _ryaml().dump(
+        data,
+        _path,
+        # Remove spaces at the start of each (non-commented) line, caused by the indent configuration.
+        # This is only needed when the YAML data is a list of items, like in the problems.yaml file.
+        # See also: https://stackoverflow.com/a/58773229
+        transform=(
+            (
+                lambda yaml_str: "\n".join(
+                    line if line.strip().startswith("#") else line[2:]
+                    for line in yaml_str.split("\n")
+                )
+            )
+            if isinstance(data, list)
+            else None
+        ),
+    )
+    if isinstance(_path, StringIO):
+        string = _path.getvalue()
+        _path.close()
+        return string
+    return None
+
+
+def _ask_variable(name: str, default: Optional[str] = None, *, allow_empty: bool = False) -> str:
+    if config.args.defaults:
+        if not default and not allow_empty:
+            bar.fatal(f"{name} has no default")
+        return default or ""
+    while True:
+        msg = f"{Style.DIM}{Fore.BLUE}?{Style.RESET_ALL} {Style.BRIGHT}{name}:{Style.RESET_ALL} {Fore.YELLOW}"
+        val = input(msg)
+        print(Style.RESET_ALL, end="")
+        val = val or default or ""
+        if val or allow_empty:
+            return val
+
+
+def ask_variable_string(
+    name: str, default: Optional[str] = None, *, allow_empty: bool = False
+) -> str:
+    if use_questionary:
+        import questionary
+
+        def validate(text: str) -> Literal[True] | str:
+            return True if allow_empty or text else "Please enter a value"
+
+        return cast(
+            "str",
+            questionary.text(f"{name}:", default=default or "", validate=validate).unsafe_ask(),
+        )
+    else:
+        text = f" ({default})" if default else ""
+        return _ask_variable(name + text, default if default else "", allow_empty=allow_empty)
+
+
+def ask_variable_bool(name: str, default: bool = True) -> bool:
+    if use_questionary:
+        import questionary
+
+        return cast(
+            "bool",
+            questionary.confirm(f"{name}?", default=default, auto_enter=False).unsafe_ask(),
+        )
+    else:
+        text = " (Y/n)" if default else " (y/N)"
+        return _ask_variable(name + text, "Y" if default else "N").lower()[0] == "y"
+
+
+def ask_variable_choice(name: str, choices: Sequence[str], default: Optional[str] = None) -> str:
+    if use_questionary:
+        import questionary
+
+        plain = questionary.Style([("selected", "noreverse")])
+        return cast(
+            "str",
+            questionary.select(
+                f"{name}:", choices=choices, default=default, style=plain
+            ).unsafe_ask(),
+        )
+    else:
+        default = default or choices[0]
+        text = f" ({default})" if default else ""
+        while True:
+            got = _ask_variable(name + text, default if default else "")
+            if got in choices:
+                return got
+            else:
+                bar.warn(f"unknown option: {got}")
+
+
+# check if windows supports symlinks
+if is_windows():
+    link_parent = Path(tempfile.gettempdir()) / "bapctools"
+    link_dest = link_parent / "dir"
+    link_dest.mkdir(parents=True, exist_ok=True)
+    link_src = link_parent / "link"
+    if link_src.exists() or link_src.is_symlink():
+        link_src.unlink()
+    try:
+        link_src.symlink_to(link_dest, True)
+        windows_can_symlink = True
+    except OSError:
+        windows_can_symlink = False
+        bar.warn(
+            """Please enable the developer mode in Windows to enable symlinks!
+- Open the Windows Settings
+- Go to "Update & security"
+- Go to "For developers"
+- Enable the option "Developer Mode"
+"""
+        )
+
+
+# When output is True, copy the file when args.cp is true.
+def ensure_symlink(
+    link: Path, target: Path, *, output: bool = False, relative: bool = False
+) -> bool:
+    try:
+        # on windows copy if necessary
+        if is_windows() and not windows_can_symlink:
+            remove_path(link)
+            shutil.copyfile(target, link)
+            return True
+
+        # For output files: copy them on Windows, or when --cp is passed.
+        if output and config.args.cp:
+            remove_path(link)
+            shutil.copyfile(target, link)
+            return True
+
+        # Do nothing if link already points to the right target.
+        if link.is_symlink() and link.resolve() == target.resolve():
+            is_absolute = link.readlink() == target.absolute()
+            if not relative and is_absolute:
+                return True
+            # if relative and not is_absolute: return
+
+        if link.is_symlink() or link.exists():
+            remove_path(link)
+
+        # for windows the symlink needs to know if it points to a directory or file
+        if relative:
+            # Rewrite target to be relative to link.
+            # Use os.path.relpath instead of Path.relative_to for non-subdirectories.
+            link.symlink_to(os.path.relpath(target, link.parent), target.is_dir())
+        else:
+            link.symlink_to(target.absolute(), target.is_dir())
+        return True
+    except (FileNotFoundError, FileExistsError):
+        # this must be a race condition
+        return False
+
+
+# glob, but without hidden files
+def glob(path: Path, expression: str, *, include_hidden: bool = False) -> list[Path]:
+    def keep(p: Path) -> bool:
+        if not include_hidden:
+            for d in p.parts:
+                if d[0] == ".":
+                    return False
+
+        if p.suffix in [".template", ".disabled"]:
+            return False
+
+        if config.RUNNING_TEST:
+            suffixes = p.suffixes
+            if len(suffixes) >= 1 and suffixes[-1] == ".bad":
+                return False
+            if len(suffixes) >= 2 and suffixes[-2] == ".bad":
+                return False
+
+        return True
+
+    return sorted(p for p in path.glob(expression) if keep(p))
+
+
+def has_substitute(
+    inpath: Path, pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX
+) -> bool:
+    try:
+        data = inpath.read_text()
+    except UnicodeDecodeError:
+        return False
+    return pattern.search(data) is not None
+
+
+def substitute(
+    data: str,
+    variables: Optional[Mapping[str, Optional[object]]],
+    *,
+    pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX,
+) -> str:
+    if variables is None:
+        variables = {}
+
+    def substitute_function(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name in variables:
+            return str(variables[name]) if variables[name] is not None else ""
+        else:
+            variable = match.group()
+            bar.warn(f"Found pattern '{variable}' but no substitution was provided. Skipped.")
+            return variable
+
+    return pattern.sub(substitute_function, data)
+
+
+def copy_and_substitute(
+    inpath: Path,
+    outpath: Path,
+    variables: Optional[Mapping[str, Optional[object]]],
+    *,
+    pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX,
+) -> None:
+    try:
+        data = inpath.read_text()
+    except UnicodeDecodeError:
+        # skip this file
+        bar.log(f'File "{inpath}" is not a text file.')
+        return
+    data = substitute(data, variables, pattern=pattern)
+    remove_path(outpath)
+    outpath.write_text(data)
+
+
+def substitute_file_variables(
+    path: Path,
+    variables: Optional[Mapping[str, Optional[object]]],
+    *,
+    pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX,
+) -> None:
+    copy_and_substitute(path, path, variables, pattern=pattern)
+
+
+def substitute_dir_variables(
+    dirname: Path,
+    variables: Optional[Mapping[str, Optional[object]]],
+    *,
+    pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX,
+) -> None:
+    for path in dirname.rglob("*"):
+        if path.is_file():
+            substitute_file_variables(path, variables, pattern=pattern)
+
+
+# copies a directory recursively and substitutes {%key%} by their value in text files
+# reference: https://docs.python.org/3/library/shutil.html#copytree-example
+def copytree_and_substitute(
+    src: Path,
+    dst: Path,
+    variables: Optional[Mapping[str, Optional[object]]],
+    *,
+    exist_ok: bool = True,
+    preserve_symlinks: bool = True,
+    base: Optional[Path] = None,
+    skip: Optional[Iterable[Path]] = None,
+    pattern: re.Pattern[str] = config.BAPCTOOLS_SUBSTITUTE_REGEX,
+) -> None:
+    if base is None:
+        base = src
+
+    if skip and src in skip:
+        pass
+    elif preserve_symlinks and src.is_symlink():
+        shutil.copy(src, dst, follow_symlinks=False)
+    elif (
+        src.is_symlink()
+        and not src.readlink().is_absolute()
+        and Path(os.path.normpath(src.absolute().parent / src.readlink())).is_relative_to(
+            base.absolute()
+        )
+    ):
+        # link is local -> preserve it
+        shutil.copy(src, dst, follow_symlinks=False)
+    elif src.is_dir():
+        dst.mkdir(parents=True, exist_ok=exist_ok)
+        errors = []
+        for d in src.iterdir():
+            src_file = src / d.name
+            dst_file = dst / d.name
+            try:
+                copytree_and_substitute(
+                    src_file,
+                    dst_file,
+                    variables,
+                    exist_ok=exist_ok,
+                    preserve_symlinks=preserve_symlinks,
+                    base=base,
+                    skip=skip,
+                    pattern=pattern,
+                )
+            except OSError as why:
+                errors.append((src_file, dst_file, str(why)))
+            # catch the Error from the recursive copytree so that we can
+            # continue with other files
+            except Exception as err:
+                errors.append(err.args[0])
+        if errors:
+            raise Exception(errors)
+
+    elif dst.exists():
+        bar.warn(f'File "{dst}" already exists, skipping...')
+    else:
+        try:
+            data = src.read_text()
+            data = substitute(data, variables, pattern=pattern)
+            dst.write_text(data)
+        except UnicodeDecodeError:
+            # Do not substitute for binary files.
+            dst.write_bytes(src.read_bytes())
+
+
+# this eval is still dangerous, but on the other hand we run submission code so this is fine
+def math_eval(text: str) -> Optional[int | float]:
+    # try to guess the meaning of dot and comma (punctuation and separator)
+    if text.count(".") != 1 and text.count(",") <= 1:
+        text = text.translate(str.maketrans(".,", ",."))
+    text = text.replace(",", "")
+
+    # make math eval slightly safer
+    allowed = string.digits + "+-*/()." + "eE" + string.whitespace
+    if any(c not in allowed for c in text):
+        return None
+
+    with suppress(Exception):
+        value = eval(text, {"__builtin__": None})
+        if isinstance(value, (int, float)):
+            return value
+    return None
+
+
+def crop_line(output: str, limit: int) -> str:
+    output = output.strip()
+    if "\n" in output:
+        output = output.partition("\n")[0] + "[...]"
+    if len(output) > limit:
+        output = f"{output[: limit - 5]}[...]"
+    return output
+
+
+def tail(string: str, limit: int) -> str:
+    lines = string.split("\n")
+    if len(lines) > limit:
+        lines = lines[-limit:]
+        lines[0] = f"{Style.DIM}[...]{Style.RESET_ALL}"
+    return "\n".join(lines)
+
+
+class ExecStatus(Enum):
+    ACCEPTED = 1
+    REJECTED = 2
+    ERROR = 3
+    TIMEOUT = 4
+
+    def __bool__(self) -> bool:
+        return self == ExecStatus.ACCEPTED
+
+
+@dataclass
+class ExecResult:
+    returncode: Optional[int]
+    status: ExecStatus
+    duration: int | float
+    timeout_expired: bool
+    err: Optional[str]
+    out: Optional[str]
+    verdict: Optional["Verdict"] = None
+    pass_id: Optional[int] = None
+
+
+def command_supports_memory_limit(command: Sequence[str | Path]) -> bool:
+    # JVM does not work with limited ram: https://bugs.openjdk.org/browse/JDK-8071445
+    # sbcl has a hardcoded limit of (typically) 1GB, if the memory limit is lower it would break
+    return Path(command[0]).name not in [
+        "java",
+        "javac",
+        "kotlin",
+        "kotlinc",
+        "scala",
+        "scalac",
+        "sbcl",
+    ]
+
+
+def limit_setter(
+    command: Optional[Sequence[str | Path]],
+    timeout: Optional[int],
+    memory_limit: Optional[int],
+    group: Optional[int] = None,
+) -> Optional[Callable[[], None]]:
+    # preexec_fn is only supported on unix
+    if is_windows():
+        return None
+
+    # perform all syscalls / things that could fail in the current context, i.e., outside of the preexec_fn
+    disable_stack_limit = not is_bsd()
+
+    if config.args.memory:
+        memory_limit = config.args.memory
+    if memory_limit:
+        memory_limit *= 1024**2
+        assert command is not None
+        if not command_supports_memory_limit(command):
+            memory_limit = None
+    if config.args.sanitizer or is_bsd():
+        memory_limit = None
+
+    if disable_stack_limit:
+        current = resource.getrlimit(resource.RLIMIT_STACK)
+        if current[1] != resource.RLIM_INFINITY:
+            bar.fatal("Stacklimit must be unlimited")
+    if memory_limit is not None:
+        current = resource.getrlimit(resource.RLIMIT_AS)
+        if current[1] != resource.RLIM_INFINITY and current[1] < memory_limit:
+            bar.fatal(f"Insufficient memory limit: {current[1]}")
+
+    # actual preexec_fn called in the context of the new process
+    # this should only do resource and os calls to stay safe
+    def setlimits() -> None:
+        if timeout is not None:
+            resource.setrlimit(resource.RLIMIT_CPU, (timeout + 1, timeout + 1))
+
+        # disable the max stack size
+        if disable_stack_limit:
+            resource.setrlimit(
+                resource.RLIMIT_STACK, (resource.RLIM_INFINITY, resource.RLIM_INFINITY)
+            )
+
+        if memory_limit is not None:
+            resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+
+        if group is not None:
+            os.setpgid(0, group)
+
+        # disable coredumps
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+
+    return setlimits
+
+
+# Subclass Popen to get rusage information.
+class ResourcePopen(subprocess.Popen[bytes]):
+    rusage: Optional["resource.struct_rusage"] = None
+
+    # If wait4 is available, store resource usage information.
+    if hasattr(os, "wait4"):
+
+        def _try_wait(self, wait_flags: int) -> tuple[int, int]:
+            """All callers to this function MUST hold self._waitpid_lock."""
+            try:
+                (pid, sts, res) = os.wait4(self.pid, wait_flags)
+            except ChildProcessError:
+                # This happens if SIGCLD is set to be ignored or waiting
+                # for child processes has otherwise been disabled for our
+                # process.  This child is dead, we can't get the status.
+                pid = self.pid
+                sts = 0
+            else:
+                self.rusage = res
+            return (pid, sts)
+
+
+class AbortError(Exception):
+    pass
+
+
+def default_exec_code_map(returncode: int) -> ExecStatus:
+    if returncode == 0:
+        return ExecStatus.ACCEPTED
+    if returncode == -9:
+        return ExecStatus.TIMEOUT
+    return ExecStatus.ERROR
+
+
+def validator_exec_code_map(returncode: int) -> ExecStatus:
+    if returncode == config.RTV_AC:
+        return ExecStatus.ACCEPTED
+    if returncode == config.RTV_WA:
+        return ExecStatus.REJECTED
+    if returncode == -9:
+        return ExecStatus.TIMEOUT
+    return ExecStatus.ERROR
+
+
+# Run `command`, returning stderr if the return code is unexpected.
+def exec_command(
+    command: Sequence[str | Path],
+    exec_code_map: Callable[[int], ExecStatus] = default_exec_code_map,
+    *,
+    crop: bool = True,
+    preexec_fn: bool = True,
+    timeout: Optional[int] = None,
+    memory: Optional[int] = None,
+    stdout: Optional[int | BinaryIO | Literal[True]] = True,
+    stderr: Optional[int | BinaryIO | Literal[True]] = True,
+    **kwargs: Any,
+) -> ExecResult:
+    # By default: return stdour and stderr
+    kwargs["stdout"] = subprocess.PIPE if stdout is True else stdout
+    kwargs["stderr"] = subprocess.PIPE if stderr is True else stderr
+    assert "text" not in kwargs
+
+    # Convert any Pathlib objects to string.
+    command = [str(x) for x in command]
+
+    if config.args.verbose >= 2:
+        bar.eprint("cd", kwargs.get("cwd", Path.cwd()), "; ", end="")
+        bar.eprint(*command, end="")
+        stdin = kwargs.get("stdin")
+        if stdin is not None:
+            bar.eprint(" <", getattr(stdin, "name", stdin), end="")
+        bar.eprint()
+
+    if preexec_fn:
+        kwargs["preexec_fn"] = limit_setter(command, timeout, memory)
+
+    process: Optional[ResourcePopen] = None
+
+    timeout_expired = False
+    tstart = time.monotonic()
+
+    with ExitStack() as cleanup:
+        try:
+            process = ResourcePopen(command, **kwargs)
+            cleanup.enter_context(process)
+            cleanup.callback(process.kill)
+        except (PermissionError, OSError) as e:
+            # File is likely not executable / probably doesn't exist.
+            return ExecResult(None, ExecStatus.ERROR, 0, False, str(e), None)
+
+        try:
+            (out, err) = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Timeout expired.
+            timeout_expired = True
+            process.kill()
+            (out, err) = process.communicate()
+
+    tend = time.monotonic()
+
+    # -2 corresponds to SIGINT, i.e. keyboard interrupt / CTRL-C.
+    if process.returncode == -2:
+        raise KeyboardInterrupt()
+
+    def maybe_crop(s: str) -> str:
+        s = s.rstrip()
+        return crop_output(s) if crop else s
+
+    status = exec_code_map(process.returncode)
+    res_err = maybe_crop(err.decode("utf-8", "replace")) if err is not None else None
+    res_out = maybe_crop(out.decode("utf-8", "replace")) if out is not None else None
+
+    if process.rusage:
+        duration = process.rusage.ru_utime + process.rusage.ru_stime
+        # It may happen that the Rusage is low, even though a timeout was raised, i.e. when calling sleep().
+        # To prevent under-reporting the duration, we take the max with wall time in this case.
+        if timeout_expired:
+            duration = max(tend - tstart, duration)
+    else:
+        duration = tend - tstart
+
+    return ExecResult(process.returncode, status, duration, timeout_expired, res_err, res_out)
+
+
+class ShellCommand:
+    @staticmethod
+    def get(cmd: str) -> Optional["ShellCommand"]:
+        if shutil.which(cmd) is None:
+            return None
+        return ShellCommand(cmd)
+
+    def __init__(self, cmd: str) -> None:
+        self.cmd = cmd
+
+    def __call__(self, *args: str | Path) -> str:
+        res = exec_command(
+            [self.cmd, *args],
+            crop=False,
+            preexec_fn=False,
+            timeout=None,
+        )
+        return res.out if res.status == ExecStatus.ACCEPTED and res.out else ""
+
+
+def inc_label(label: str) -> str:
+    prefix = label.rstrip("Z")
+    mid = chr(ord(prefix[-1]) + 1) if prefix else "A"
+    suffix = "A" * (len(label) - len(prefix))
+    return prefix[:-1] + mid + suffix
+
+
+def combine_hashes(values: Sequence[str]) -> str:
+    hasher = hashlib.sha512(usedforsecurity=False)
+    for item in sorted(values):
+        hasher.update(item.encode())
+    return hasher.hexdigest()
+
+
+def combine_hashes_dict(d: Mapping[str, Optional[str]]) -> str:
+    hasher = hashlib.sha512(usedforsecurity=False)
+    for key, value in d.items():
+        hasher.update(key.encode())
+        if value is not None:
+            hasher.update(value.encode())
+    return hasher.hexdigest()
+
+
+def hash_string(string: str) -> str:
+    sha = hashlib.sha512(usedforsecurity=False)
+    sha.update(string.encode())
+    return sha.hexdigest()
+
+
+def hash_file_content(file: Path, buffer_size: int = 65536) -> str:
+    if not file.is_file():
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(file))
+    sha = hashlib.sha512(usedforsecurity=False)
+
+    with file.open("rb") as f:
+        while True:
+            data = f.read(buffer_size)
+            if not data:
+                break
+            sha.update(data)
+
+    return sha.hexdigest()
+
+
+def hash_file(file: Path, buffer_size: int = 65536) -> str:
+    if not file.is_file():
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(file))
+    sha = hashlib.sha512(usedforsecurity=False)
+    name = file.name.encode("utf-8")
+    sha.update(len(name).to_bytes(8, "big"))
+    sha.update(name)
+
+    with file.open("rb") as f:
+        while True:
+            data = f.read(buffer_size)
+            if not data:
+                break
+            sha.update(data)
+
+    return sha.hexdigest()
+
+
+def hash_file_or_dir(file_or_dir: Path, buffer_size: int = 65536) -> str:
+    if file_or_dir.is_dir():
+        return combine_hashes(
+            [hash_string(file_or_dir.name)]
+            + [hash_file_or_dir(f, buffer_size=buffer_size) for f in file_or_dir.iterdir()]
+        )
+    else:
+        return hash_file(file_or_dir, buffer_size=buffer_size)
+
+
+def generate_problem_uuid() -> str:
+    uuid_bytes = bytearray(secrets.token_bytes(16))
+    # mark this as v8 uuid (custom uuid) variant 0
+    uuid_bytes[6] &= 0b0000_1111
+    uuid_bytes[6] |= 0b1000_0000
+    uuid_bytes[8] &= 0b0011_1111
+    # format as uuid
+    uuid = uuid_bytes.hex()
+    uuid = f"{uuid[0:8]}-{uuid[8:12]}-{uuid[12:16]}-{uuid[16:20]}-{uuid[20:32]}"
+    # make the first bytes BAPCtools specific
+    uuid = config.BAPC_UUID[: config.BAPC_UUID_PREFIX] + uuid[config.BAPC_UUID_PREFIX :]
+    return uuid
+
+
+def is_uuid(uuid: str) -> bool:
+    try:
+        return uuid.casefold() == str(UUID(uuid)).casefold()
+    except ValueError:
+        return False

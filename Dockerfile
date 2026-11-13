@@ -1,4 +1,4 @@
-# NOTE: This installs the BAPCtools version from the GitHub master branch.
+# Install the latest public BAPCtools release from PyPI.
 FROM archlinux:latest
 MAINTAINER ragnar.grootkoerkamp@gmail.com
 
@@ -16,8 +16,12 @@ RUN pacman -Syu --noconfirm \
 	python-argcomplete \
 	python-colorama \
 	python-matplotlib \
+	python-pip \
+	python-pipx \
 	python-pytest \
+	python-requests \
 	python-ruamel-yaml \
+	python-typing_extensions \
 	python-yaml \
 	jdk21-openjdk \
 	kotlin \
@@ -26,6 +30,7 @@ RUN pacman -Syu --noconfirm \
 	texlive-binextra \
 	texlive-langeuropean \
 	texlive-langgerman \
+	texlive-langextra \
 	texlive-latexextra \
 	texlive-pictures \
 	texlive-science \
@@ -36,9 +41,11 @@ RUN pacman -Syu --noconfirm \
 	cue \
 	&& pacman -Scc --noconfirm
 
-RUN git clone https://github.com/RagnarGrootKoerkamp/BAPCtools /opt/bapctools && \
-	ln -sfn /opt/bapctools/bin/tools.py /usr/bin/bt && ln -sfn /opt/bapctools/third_party/checktestdata /usr/bin/checktestdata
+ENV PIPX_HOME=/opt/pipx
+ENV PIPX_BIN_DIR=/usr/local/bin
+RUN pipx install bapctools
 
 RUN mkdir /data
 WORKDIR /data
-ENTRYPOINT ["/bin/bt"]
+RUN ln -s /usr/local/bin/bt bt
+ENTRYPOINT ["bt"]

@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+
+TESTIN="$1";  shift
+TESTANS="$1"; shift
+FEEDBACKDIR="$1"; shift
+
+outfile="$FEEDBACKDIR/out"
+touch "$outfile"
+
+echo "COMMAND: " ./jury "$TESTIN" "$outfile" >&2
+"$SCRIPT_DIR/jury" "$TESTIN" "$outfile"
+ret=$?
+
+echo "$outfile" >&2
+exit $ret

@@ -1,46 +1,58 @@
 import collections
-import pytest
-import yaml
 from pathlib import Path
 
-import generate
-import config
+import pytest
+import yaml
+
+from bapctools import bar, config, generate
+from bapctools.bar import PrintBar
 
 config.RUNNING_TEST = True
-config.set_default_args()
+
+
+class MockSettings:
+    def __init__(self):
+        self.constants = {}
 
 
 class MockProblem:
     def __init__(self):
         self.path = Path(".")
-        self._program_callbacks = dict()
-        self._rules_cache = dict()
+        self.settings = MockSettings()
+        self.interactive = False
+        self.multi_pass = False
+
+    def register_program_callback(self, path, c):
+        pass
 
 
 class MockGeneratorConfig(generate.GeneratorConfig):
     def __init__(self, problem, restriction=None):
         self.problem = problem
+        self.n_test_case_error = 0
         self.n_parse_error = 0
 
-        # A map of paths `secret/testgroup/testcase` to their canonical TestcaseRule.
+        # A map of paths `secret/test_group/test_case` to their canonical TestCaseRule.
         # For generated cases this is the rule itself.
-        # For included cases, this is the 'resolved' location of the testcase that is included.
+        # For included cases, this is the 'resolved' location of the test case that is included.
         self.known_cases = dict()
-        # A set of paths `secret/testgroup`.
+        # A set of paths `secret/test_group`.
         # Used for cleanup.
         self.known_directories = dict()
         # Used for cleanup
         self.known_files = set()
-        # A map from key to (is_included, list of testcases and directories),
+        # A map from key to (is_included, list of test cases and directories),
         # used for `include` statements.
         self.known_keys = collections.defaultdict(lambda: [False, []])
-        # A set of testcase rules, including seeds.
+        # A set of test case rules, including seeds.
         self.rules_cache = dict()
-        # The set of generated testcases keyed by testdata.
+        # The set of generated test cases keyed by hash(test_case).
         # Used to delete duplicated unlisted cases.
-        self.generated_testdata = dict()
+        self.generated_test_cases = dict()
         # Path to the trash directory for this run
-        self.trashdir = None
+        self.trash_dir = None
+        # Set of hash(.in) for all generated test cases
+        self.hashed_in = set()
         # Files that should be processed
         self.restriction = restriction
 
@@ -48,14 +60,25 @@ class MockGeneratorConfig(generate.GeneratorConfig):
 class TestGeneratorConfig:
     @pytest.mark.parametrize(
         "yamldoc",
-        yaml.load_all(
-            Path("test/yaml/generators/invalid_yaml/bad_generators.yaml").read_text(),
-            Loader=yaml.SafeLoader,
+        list(
+            yaml.load_all(
+                Path("test/yaml/generators/invalid_yaml/bad_generators.yaml").read_text(),
+                Loader=yaml.SafeLoader,
+            )
         ),
     )
+    @bar.restore
     def test_bad_generators_yamls(self, yamldoc):
-        with pytest.raises(generate.ParseException):
+        config.n_warn = 0
+        config.n_error = 0
+        with pytest.raises(generate.ParseError):
             gen_config = MockGeneratorConfig(MockProblem())
-            gen_config.parse_yaml(yamldoc)
-            if gen_config.n_parse_error > 0:
-                raise generate.ParseException()
+            local_bar = bar.use_globally(PrintBar("mock"))
+            gen_config._parse_root(yamldoc, local_bar)
+            if (
+                gen_config.n_test_case_error > 0
+                or gen_config.n_parse_error > 0
+                or config.n_warn > 0
+                or config.n_error > 0
+            ):
+                raise generate.ParseError("")

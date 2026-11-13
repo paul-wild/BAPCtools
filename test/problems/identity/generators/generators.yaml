@@ -1,6 +1,4 @@
 solution: /submissions/accepted/author.py
-# The visualizer is disabled to speed up testing.
-#visualizer: /visualizers
 random_salt: "abc"
 
 generators:
@@ -57,6 +55,9 @@ data:
         in: "0"
         # 0 is quoted since only strings are allowed to prevent conversion issues.
         ans: "0"
+        match:
+          in: "^0$"
+          ans: ["^0", "0$"]
       "2":
         # Use | for multi-line input
         in: |
@@ -67,6 +68,17 @@ data:
         copy: manual/sample
       "4":
         copy: manual/inans
+      "5":
+        in: "5"
+        ans: "5"
+        out: "5"
+      "6":
+        in.statement: "6"
+        ans.statement: "6"
+        in.download: {link: in.statement}
+        ans.download: {link: ans.statement}
+    test_group.yaml:
+      output_visualizer_args: [--draw-please]
 
   secret:
     data:
@@ -75,7 +87,7 @@ data:
           stdoutpy: stdout.py 200
           stdoutcpp: stdout.cpp 201
           inans: write_in_and_ans.py 202
-          hintdesc: hint_desc.py 203
+          hint_desc_yaml: hint_desc_yaml.py 203
           main_py: main_py 204
           main_c: main_c 205
           main_cpp: main_cpp 206
@@ -90,7 +102,7 @@ data:
         data:
           # Both ~ (None) and the empty string can be used to have only numbers as testcase names.
           - ~: stdout.py 123 # 01.in
-          - "": stdout.py 124
+            #- "": stdout.py 124
           - "": stdout.py 125
           - "": stdout.py 126
           - "": stdout.py 127
@@ -126,7 +138,6 @@ data:
         solution: /generators/solution.c
         generate: random_gen.py {seed:7}
       testcase_dict_3:
-        visualizer:
         generate: random_gen.py {seed:8}
       unused_args_1: > # Spread arguments over multiple lines.
         random_gen.py
@@ -183,7 +194,13 @@ data:
         data:
           - count1:
               generate: stdout.py 700 {count}
-              count: 1
+              count: [1] # same as count: 1
+          - primes:
+              generate: stdout.py {count}
+              count: [907, 911, 919]
+          - dotdot:
+              generate: stdout.py {count}
+              count: 801..=803 # same as [801, 802, 803]
           - generate:
               generate: stdout.py 701 {name}
               count: 3
@@ -199,10 +216,10 @@ data:
       count_group:
         data:
           generate:
-              generate: stdout.py 704
-              count: 3
+            generate: stdout.py 704
+            count: 3
           seed:
-              generate: random_gen.py {seed:10}
-              count: 3
+            generate: random_gen.py {seed:10}
+            count: 3
 
 unknown_key:

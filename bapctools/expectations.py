@@ -1,0 +1,321 @@
+import re
+from collections.abc import Mapping, Sequence
+from typing import Final, Optional, TYPE_CHECKING
+
+from bapctools import bar, config
+from bapctools.test_case import TestCase
+from bapctools.util import once_per_instance, read_yaml, YamlParser
+from bapctools.verdicts import Verdict
+
+if TYPE_CHECKING:
+    from bapctools.problem import Problem
+    from bapctools.run import Submission
+
+
+class Person:
+    def __init__(self, yaml_data: str | dict[object, object], parent_path: str):
+        if isinstance(yaml_data, dict):
+            parser = YamlParser(yaml_data, parent_path)
+            self.name: str = parser.extract("name", "")
+            self.email: Optional[str] = parser.extract_optional("email", str)
+            self.kattis: Optional[str] = parser.extract_optional("kattis", str)
+            self.orcid: Optional[str] = parser.extract_optional("orcid", str)
+            parser.check_unknown_keys()
+        else:
+            match = re.match("(.*)<(.*)>", yaml_data)
+            self.name = (match[1] if match else yaml_data).strip()
+            self.email = match[2].strip() if match else None
+            self.kattis = self.orcid = None
+        for token in [",", " and ", "&"]:
+            if token in self.name:
+                bar.warn(
+                    f"found suspicious token '{token.strip()}' in `{parent_path}.name`: {self.name}"
+                )
+
+    @staticmethod
+    def extract_optional_persons(source: YamlParser, key: str) -> list["Person"]:
+        key_path = f"{source.parent_path}.{key}"
+        if key in source.remaining:
+            value = source.remaining.pop(key)
+            if value is None:
+                return []
+            if isinstance(value, (str, dict)):
+                return [Person(value, key_path)]
+            if isinstance(value, list):
+                if not all(isinstance(v, (str, dict)) for v in value):
+                    bar.warn(f"some values for key `{key_path}` have invalid type. SKIPPED.")
+                    return []
+                if not value:
+                    bar.warn(f"value for `{key_path}` should not be an empty list.")
+                return [Person(v, f"{key_path}[{i}]") for i, v in enumerate(value)]
+            bar.warn(f"incompatible value for key `{key_path}`. SKIPPED.")
+        return []
+
+
+EXPECTATION_VERDICTS: Final[Sequence[Verdict]] = [
+    Verdict.ACCEPTED,
+    Verdict.WRONG_ANSWER,
+    Verdict.TIME_LIMIT_EXCEEDED,
+    Verdict.RUNTIME_ERROR,
+]
+KNOWN_EXPECTATION_VERDICTS: Final[Mapping[str, Verdict]] = {
+    v.short: v for v in EXPECTATION_VERDICTS
+}
+
+
+class Glob:
+    SUSPICIOUS_REGEX: Final[re.Pattern[str]] = re.compile(r"[^a-zA-Z0-9_./-]|//")
+    TOKEN_REGEX: Final[re.Pattern[str]] = re.compile(r"\*\*|[{,}*]|[^*{,}]+")
+
+    @staticmethod
+    def _compile(raw: Optional[str]) -> bool | re.Pattern[str]:
+        if raw is None:
+            return True
+
+        # Note: dir/ and dir should match the same
+        token_stream = Glob.TOKEN_REGEX.finditer(raw.removesuffix("/"))
+        suspicious_braces = False
+        suspicious = []
+        parsed = []
+
+        def parse_recursive(depth: int = 0) -> None:
+            nonlocal suspicious_braces
+
+            choice = False
+            for token in token_stream:
+                text = token.group()
+                match text:
+                    case "*":
+                        # stars match anything exept '/'
+                        parsed.append("[^/]*")
+                    case "**":
+                        suspicious.append(text)
+                        parsed.append("[^/]*")
+                    case "{":
+                        parsed.append("(?:")
+                        parse_recursive(depth + 1)
+                        parsed.append(")")
+                    case "}":
+                        if depth == 0:
+                            raise ValueError(f"unmatched {{ in `{raw}`")
+                        suspicious_braces |= not choice
+                        return
+                    case "," if depth > 0:
+                        choice = True
+                        parsed.append("|")
+                    case _:
+                        suspicious.extend(Glob.SUSPICIOUS_REGEX.findall(text))
+                        parsed.append(re.escape(text))
+            if depth > 0:
+                raise ValueError(f"unexpected end of glob in `{raw}`")
+
+        try:
+            parse_recursive()
+        except RecursionError:
+            bar.error(f"braces nested too deep in `{raw}`")
+            return False
+        except ValueError as e:
+            bar.error(str(e))
+            return False
+
+        if suspicious_braces:
+            bar.warn(f"found brace with only one option in `{raw}`")
+        if suspicious:
+            s = "s" if len(suspicious) > 1 else ""
+            bar.warn(f"found suspicious sequence{s} `{'`, `'.join(set(suspicious))}` in `{raw}`")
+
+        glob = "".join(parsed)
+        # match from start and only match complete directories
+        return re.compile(rf"^{glob}(/|$)")
+
+    def __init__(self, glob: Optional[str]) -> None:
+        self.glob: Optional[str] = glob
+        self.regex: bool | re.Pattern[str] = Glob._compile(glob)
+
+    def __str__(self) -> str:
+        return self.glob or ""
+
+    def is_root(self) -> bool:
+        return self.glob is None
+
+    def matches(self, path: str) -> bool:
+        if isinstance(self.regex, bool):
+            return self.regex
+        return self.regex.match(path) is not None
+
+
+# Represents a submissions.yaml entry of a test case glob
+class TestCaseExpectation:
+    def __init__(self, parser: Optional[YamlParser] = None, glob: Optional[str] = None):
+        if parser is None:
+            parser = YamlParser({})
+
+        self.glob = Glob(glob)
+
+        def extract_verdicts(key: str, default: Optional[set[Verdict]] = None) -> set[Verdict]:
+            if default is None:
+                default = set(EXPECTATION_VERDICTS)
+            verdicts = parser.extract_optional_list(key, str)
+            if not verdicts:
+                return default
+            if any(v not in KNOWN_EXPECTATION_VERDICTS for v in verdicts):
+                bar.warn(f"some values for key `{parser.parent_path}.{key}` are unknown. SKIPPED.")
+                return default
+            return {KNOWN_EXPECTATION_VERDICTS[v] for v in verdicts}
+
+        self.permitted: set[Verdict] = extract_verdicts("permitted")
+        self.required: set[Verdict] = extract_verdicts("required", self.permitted)
+        if not self.required.issubset(self.permitted):
+            missing = ",".join(v.short for v in self.required - self.permitted)
+            bar.warn(f"`{parser.parent_path}` has [{missing}] as required but not as permitted")
+
+        if "score" in parser.remaining:
+            # Not implemented
+            # self.score: Optional[float | tuple[float, float]] = 0
+            is_list = isinstance(parser.remaining["score"], list)
+            score = parser.extract_optional_list("score", float)
+            if len(score) not in [0, 2 if is_list else 1]:
+                bar.warn(
+                    f"(`{parser.parent_path}.score` must be a single float or a list of two floats.)"
+                )
+            bar.warn("Scoring is not implemented in BAPCtools.")
+
+        self.judge_message: Optional[str] = parser.extract_optional("judge_message", str)
+
+        use_for_time_limit = parser.extract_optional("use_for_time_limit", str)
+        if use_for_time_limit not in [None, "lower", "upper"]:
+            bar.warn(
+                f"`{parser.parent_path}.use_for_time_limit` must be `lower`, or `upper`. SKIPPED."
+            )
+        self.lower_time_limit: bool = use_for_time_limit == "lower"
+        self.upper_time_limit: bool = use_for_time_limit == "upper"
+        assert not self.lower_time_limit or not self.upper_time_limit
+
+    def matches(self, test_case: TestCase) -> bool:
+        return self.glob.matches(test_case.name)
+
+
+# Represents a submissions.yaml entry of a submission glob
+# This stores all test case globs
+class SubmissionExpectation:
+    def __init__(self, glob: str, yaml_data: Optional[dict[object, object]] = None) -> None:
+        if glob.startswith("/"):
+            bar.warn(f"submisison glob `{glob}` starts with `/`")
+        self.glob = Glob(glob)
+
+        parser = YamlParser(yaml_data or {}, glob)
+
+        self.language: Optional[str] = parser.extract_optional("language", str)
+        self.main_file: Optional[str] = parser.extract_optional("main_file", str)
+        self.authors: list[Person] = Person.extract_optional_persons(parser, "authors")
+        self.model_solution: bool = parser.extract("model_solution", False)
+
+        self.expectations: list[TestCaseExpectation] = []
+        if yaml_data is not None:
+            self.expectations.append(TestCaseExpectation(parser))
+            for key in list(parser.remaining):
+                if not isinstance(key, str):
+                    continue
+                has_prefix = False
+                for prefix in ["sample", "secret", "*"]:
+                    has_prefix |= key == prefix
+                    has_prefix |= key.startswith(f"{prefix}/")
+                if not has_prefix:
+                    bar.warn(
+                        f"test case glob `{key}` does not start with `sample`, `secret`, or `*`"
+                    )
+                self.expectations.append(TestCaseExpectation(parser.extract_parser(key), key))
+        parser.check_unknown_keys()
+
+    def matches(self, submission: "Submission") -> bool:
+        base_path = submission.problem.path.absolute() / "submissions"
+        assert submission.path.absolute().is_relative_to(base_path)
+        paths = [f.absolute().relative_to(base_path).as_posix() for f in submission.source_files]
+        paths.append(submission.name)
+        return any(self.glob.matches(f) for f in paths)
+
+    def all_matches(self, test_case: Optional[TestCase] = None) -> list[TestCaseExpectation]:
+        if test_case is None:
+            return self.expectations
+        return [e for e in self.expectations if e.matches(test_case)]
+
+    def all_permitted(self, test_case: Optional[TestCase] = None) -> set[Verdict]:
+        permitted = set(EXPECTATION_VERDICTS)
+        for e in self.all_matches(test_case):
+            permitted &= e.permitted
+        return permitted
+
+    def root_expectations(self) -> list[TestCaseExpectation]:
+        return [e for e in self.expectations if e.glob.is_root()]
+
+    def is_accepted(self) -> bool:
+        """
+        A submission is considered accepted if its root TestCaseExpectation only permits AC
+        """
+        return any(e.permitted == {Verdict.ACCEPTED} for e in self.root_expectations())
+
+
+# This stores all data in the submissions.yaml
+class Expectations:
+    def __init__(self, problem: "Problem") -> None:
+        self.expectations: dict[str, SubmissionExpectation] = {}
+
+        for d in [config.RESOURCES_ROOT / "config", problem.path / "submissions"]:
+            file = d / "submissions.yaml"
+            if not file.is_file():
+                continue
+
+            yaml_data = read_yaml(file, empty={})
+            if not isinstance(yaml_data, dict):
+                bar.fatal("could not parse submissions.yaml.")
+            for glob, expectation in yaml_data.items():
+                if not isinstance(glob, str):
+                    bar.error(f"invalid key: {glob}. SKIPPED.")
+                    continue
+                if not isinstance(expectation, dict):
+                    bar.error(f"incompatible value for key `{glob}`. SKIPPED.")
+                    continue
+                if glob in self.expectations:
+                    bar.error(f"key `{glob}` is reseved. SKIPPED.")
+                    continue
+                self.expectations[glob] = SubmissionExpectation(glob, expectation)
+
+    @once_per_instance
+    def all_matches(self, submission: "Submission") -> SubmissionExpectation:
+        languages = set()
+        main_files = set()
+        authors = set()
+
+        # A submission can be matched by multiple submissions globs
+        # => we try to combine them and warn in case of inconsistencies
+        combined = SubmissionExpectation(submission.name)
+        found_match = False
+        for expectation in self.expectations.values():
+            if not expectation.matches(submission):
+                continue
+            found_match = True
+            if expectation.language is not None:
+                languages.add(expectation.language)
+            if expectation.main_file is not None:
+                main_files.add(expectation.main_file)
+            if expectation.authors:
+                authors.add(tuple(expectation.authors))
+            combined.model_solution |= expectation.model_solution
+            combined.expectations += expectation.expectations
+
+        combined.language = min(languages, default=combined.language)
+        combined.main_file = min(main_files, default=combined.main_file)
+        combined.authors = list(min(authors, default=combined.authors))
+
+        if len(languages) > 1:
+            bar.warn(f"found multiple languages for {submission.name}, using {combined.language}")
+        if len(main_files) > 1:
+            bar.warn(f"found multiple main files for {submission.name}, using {combined.main_file}")
+        if len(authors) > 1:
+            names = ", ".join([a.name for a in combined.authors])
+            bar.warn(f"found multiple authors for {submission.name}, using {names}")
+
+        if not found_match:
+            bar.warn(f"{submission.name} not covered by submissions.yaml")
+
+        return combined

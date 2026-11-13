@@ -1,23 +1,18 @@
-import pytest
-import yaml
-import os
 import hashlib
+import os
 import tempfile
 from pathlib import Path
 
-import problem
-import testcase
-import validate
-import util
-import config
+import pytest
+import yaml
 
-RUN_DIR = Path.cwd().resolve()
+from bapctools import bar, config, problem, test_case, util, validate
+
+RUN_DIR = Path.cwd().absolute()
 # Note: the python version isn't tested by default, because it's quite slow.
-DEFAULT_OUTPUT_VALIDATORS = ["default_output_validator.cpp"]
+DEFAULT_OUTPUT_VALIDATOR = ["default_output_validator.cpp"]
 
-config.args.verbose = 2
-config.args.error = True
-config.set_default_args()
+config.args.add_if_not_set(config.ARGS("test_default_output_validator.py", verbose=2, error=True))
 
 
 # return list of (flags, ans, out, expected result)
@@ -32,17 +27,19 @@ def read_tests():
     for doc in docs:
         doc["ans"] = str(doc["ans"])
         if "ac" in doc:
-            for out in doc["ac"]:
-                tests.append((doc["flags"], doc["ans"], str(out), util.ExecStatus.ACCEPTED))
+            tests.extend(
+                (doc["flags"], doc["ans"], str(out), util.ExecStatus.ACCEPTED) for out in doc["ac"]
+            )
         if "wa" in doc:
-            for out in doc["wa"]:
-                tests.append((doc["flags"], doc["ans"], str(out), util.ExecStatus.REJECTED))
+            tests.extend(
+                (doc["flags"], doc["ans"], str(out), util.ExecStatus.REJECTED) for out in doc["wa"]
+            )
 
     print(tests)
     return tests
 
 
-@pytest.fixture(scope="class", params=DEFAULT_OUTPUT_VALIDATORS)
+@pytest.fixture(scope="class", params=DEFAULT_OUTPUT_VALIDATOR)
 def validator(request):
     problem_dir = RUN_DIR / "test/problems/identity"
     os.chdir(problem_dir)
@@ -51,11 +48,18 @@ def validator(request):
     tmpdir = Path(tempfile.gettempdir()) / ("bapctools_" + h)
     tmpdir.mkdir(exist_ok=True)
     p = problem.Problem(Path("."), tmpdir)
-    validator = validate.OutputValidator(p, RUN_DIR / "support" / request.param)
-    print(util.ProgressBar.current_bar)
-    bar = util.ProgressBar("build", max_len=1)
-    validator.build(bar)
-    bar.finalize()
+    validator = validate.OutputValidator(p, config.RESOURCES_ROOT / "support" / request.param)
+
+    @bar.restore
+    def build() -> None:
+        print(bar.ProgressBar.current_bar)
+        local_bar = bar.ProgressBar("build", max_len=1)
+        local_bar.start("Output validator")
+        validator.build()
+        local_bar.done()
+        local_bar.finalize()
+
+    build()
     yield (p, validator)
     os.chdir(RUN_DIR)
 
@@ -65,11 +69,11 @@ class MockRun:
 
 
 @pytest.mark.usefixtures("validator")
-class TestDefaultOutputValidators:
-    @pytest.mark.parametrize("testdata", read_tests())
-    def test_default_output_validators(self, validator, testdata):
+class TestDefaultOutputValidator:
+    @pytest.mark.parametrize("test_data", read_tests())
+    def test_default_output_validator(self, validator, test_data):
         problem, validator = validator
-        flags, ans, out, exp = testdata
+        flags, ans, out, exp = test_data
         flags = flags.split()
 
         (problem.tmpdir / "data").mkdir(exist_ok=True, parents=True)
@@ -81,17 +85,18 @@ class TestDefaultOutputValidators:
 
         in_path.write_text("")
 
-        t = testcase.Testcase(problem, in_path, short_path=Path("test"))
+        t = test_case.TestCase(problem, in_path, short_path=Path("test"))
         r = MockRun()
         r.in_path = in_path
         r.out_path = out_path
-        r.feedbackdir = problem.tmpdir / "data"
+        r.feedbackdir = problem.tmpdir / "data" / ".feedbackdir"
+        r.feedbackdir.mkdir(parents=True, exist_ok=True)
 
-        # TODO: the validators should probably be able to figure the flags out from the Problem config
+        # TODO: the validator should probably be able to figure the flags out from the Problem config
         result = validator.run(t, r, args=flags)
 
         if result.status != exp:
-            print(testdata)
+            print(test_data)
             for k in vars(result):
                 print(k, " -> ", getattr(result, k))
         assert result.status == exp

@@ -1,0 +1,713 @@
+import io
+import shutil
+import sys
+import threading
+import time
+from collections.abc import Callable, Sequence
+from enum import Enum
+from pathlib import Path
+from typing import Any, Literal, Optional, TYPE_CHECKING
+
+from colorama import Fore, Style
+from typing_extensions import override
+
+from bapctools import bar, config
+from bapctools.bar import BaseBar, ItemType, ProgressBar
+from bapctools.test_case import TestCase
+
+if TYPE_CHECKING:
+    from bapctools.run import Run, Submission
+
+
+class Verdict(Enum):
+    """The verdict of a test case or test group"""
+
+    ACCEPTED = (1, "AC", Fore.GREEN)
+    WRONG_ANSWER = (2, "WA", Fore.RED)
+    TIME_LIMIT_EXCEEDED = (3, "TLE", Fore.MAGENTA)
+    RUNTIME_ERROR = (4, "RTE", Fore.YELLOW)
+    JUDGE_ERROR = (5, "JE", Fore.RED)
+    COMPILER_ERROR = (6, "CE", Fore.RED)
+
+    def __init__(self, order: int, short: str, color: str) -> None:
+        self.order = order
+        self.short = short
+        self.color = color
+
+    def __str__(self) -> str:
+        return self.name.replace("_", " ")
+
+    def __lt__(self, other: "Verdict") -> bool:
+        return self.order < other.order
+
+
+class RunUntil(Enum):
+    # Run until the lexicographically first error is known.
+    FIRST_ERROR = 1
+    # Run until the lexicographically first timeout test case is known.
+    DURATION = 2
+    # Run all cases.
+    ALL = 3
+
+
+def to_char(v: Optional[Verdict | Literal[False]], *, lower: bool = False) -> str:
+    if v is None or v is False:
+        return f"{Fore.BLUE}?{Style.RESET_ALL}"
+    else:
+        char = str(v)[0]
+        return f"{v.color}{char.lower() if lower else char.upper()}{Style.RESET_ALL}"
+
+
+def to_string(v: Optional[Verdict | Literal[False]]) -> str:
+    if v is None or v is False:
+        return to_char(v)
+    else:
+        return f"{v.color}{v}{Style.RESET_ALL}"
+
+
+def from_string(s: str) -> Verdict:
+    match s:
+        case "CORRECT" | "ACCEPTED" | "AC":
+            return Verdict.ACCEPTED
+        case "WRONG-ANSWER" | "WRONG_ANSWER" | "WA":
+            return Verdict.WRONG_ANSWER
+        case "TIMELIMIT" | "TIME_LIMIT_EXCEEDED" | "TLE":
+            return Verdict.TIME_LIMIT_EXCEEDED
+        case "RUN-ERROR" | "RUN_TIME_ERROR" | "RUNTIME_ERROR" | "RTE":
+            return Verdict.RUNTIME_ERROR
+        case "NO-OUTPUT" | "NO":
+            return Verdict.WRONG_ANSWER
+        case "OUTPUT-LIMIT" | "OLE":
+            return Verdict.RUNTIME_ERROR
+        case "COMPILER-ERROR" | "CE":
+            return Verdict.COMPILER_ERROR
+        case "CHECK-MANUALLY":
+            raise NotImplementedError
+        case _:
+            raise ValueError(f"Unknown verdict string {s}")
+
+
+def from_string_domjudge(s: str) -> Verdict:
+    match s:
+        case "CORRECT" | "ACCEPTED":
+            return Verdict.ACCEPTED
+        case "WRONG-ANSWER" | "WRONG_ANSWER":
+            return Verdict.WRONG_ANSWER
+        case "TIMELIMIT" | "TIME_LIMIT_EXCEEDED":
+            return Verdict.TIME_LIMIT_EXCEEDED
+        case "RUN-ERROR" | "RUN_TIME_ERROR":
+            return Verdict.RUNTIME_ERROR
+        case "NO-OUTPUT":
+            return Verdict.WRONG_ANSWER
+        case "COMPILER-ERROR":
+            return Verdict.COMPILER_ERROR
+        case "CHECK-MANUALLY":
+            raise NotImplementedError
+        case _:
+            raise ValueError(f"Unknown DOMjudge verdict string {s}")
+
+
+class Verdicts:
+    """The verdicts of a submission.
+
+    Test cases and test groups are identified by paths.  In particular,
+    * the test case whose input file is 'a/b/1.in' is called Path('a/b/1')
+    * the two topmost test groups are Path('sample'), Path('secret')
+    * the root is called Path()
+
+    Initialised with all runs. Individual verdicts are registered
+    by alling update(), which infers verdicts upwards in the tree as they become
+    available (and returns the topmost inferred test group).
+    Verdicts (registered and inferred) are accessed with __getitem__
+
+    Attributes:
+    - run_until: type of lazy judging.
+    - children[test_group]: the lexicographically sorted list of direct children (test groups and test cases) of the given test node
+    - self[test_node]: the verdict at the given test node, or None. In particular,
+        verdict[Path()] is the root verdict, sometimes called final verdict or submission verdict.
+        Should not be directly set; use __setitem__ on the Verdict object instead.
+
+        None: not computed yet.
+        False: determined to be unneeded.
+    """
+
+    def __init__(self, runs: Sequence["Run"], run_until: RunUntil = RunUntil.FIRST_ERROR) -> None:
+        runs = [r for r in runs if not r.skip]
+        assert runs
+
+        test_cases: set[Path] = {r.test_case.short_path for r in runs}
+        assert test_cases
+        test_groups: set[Path] = {group for p in test_cases for group in p.parents}
+
+        # Lock operations reading/writing non-static data.
+        # Private methods assume the lock is already locked when entering a public method.
+        self.lock = threading.RLock()
+
+        self.run_until = run_until
+        self.has_timeout = False
+
+        # (test_case | test_group) -> Optional[Verdict | Literal[False]]
+        self.verdict: dict[Path, Optional[Verdict | Literal[False]]] = dict.fromkeys(
+            test_cases | test_groups
+        )
+        # test_case -> Optional[float]
+        self.duration: dict[Path, Optional[float]] = dict.fromkeys(test_cases)
+
+        # const test_group -> [test_group | test_case]
+        self.children: dict[Path, list[Path]] = {node: [] for node in test_groups}
+        for node in test_cases | test_groups:
+            if node.parents:
+                parent = node.parent
+                self.children[parent].append(node)
+        for tg in self.children:
+            self.children[tg].sort()
+
+    # Allow `with self` to lock.
+    def __enter__(self) -> None:
+        self.lock.__enter__()
+
+    def __exit__(self, *args: Any) -> None:
+        self.lock.__exit__(*args)
+
+    def _is_test_group(self, node: Path) -> bool:
+        return node in self.children
+
+    def _is_test_case(self, node: Path) -> bool:
+        return node not in self.children
+
+    def update(self, run: "Run") -> None:
+        """update our state based on the run (can set multiple nodes)"""
+        with self:
+            assert run.result is not None
+            assert run.result.verdict is not None
+            self.duration[run.test_case.short_path] = run.result.duration
+            self._set_verdict_for_node(
+                run.test_case.short_path, run.result.verdict, run.result.timeout_expired
+            )
+
+    def __getitem__(self, test_node: Path) -> Optional[Verdict | Literal[False]]:
+        with self:
+            return self.verdict.get(test_node, False)
+
+    def _slowest_test_case(self) -> tuple[Path, float]:
+        # This implicitly assumes there is at least one test case.
+        return max(
+            ((tc, d) for tc, d in self.duration.items() if d is not None),
+            key=lambda x: x[1],
+        )
+
+    def slowest_test_case(self) -> Optional[tuple[Path, float]]:
+        """The slowest test case, if all cases were run or a timeout occurred."""
+        with self:
+            # If not all test cases were run and the max duration is less than the timeout,
+            # we cannot claim that we know the slowest test case.
+            if None in self.duration.values() and not self.has_timeout:
+                return None
+            return self._slowest_test_case()
+
+    def salient_test_case(self) -> tuple[Path, float]:
+        """The test case most salient to the root verdict.
+        If self['.'] is Verdict.ACCEPTED, then this is the slowest test case.
+        Otherwise, it is the lexicographically first test case that was rejected."""
+        with self:
+            match self[Path()]:
+                case None:
+                    raise ValueError(
+                        "Salient test case called before submission verdict determined"
+                    )
+                case Verdict.ACCEPTED:
+                    return self._slowest_test_case()
+                case _:
+                    tc = min(
+                        tc
+                        for tc, v in self.verdict.items()
+                        if self._is_test_case(tc) and v != Verdict.ACCEPTED
+                    )
+                    duration = self.duration[tc]
+                    assert duration is not None
+                    return (tc, duration)
+
+    def aggregate(self, test_group: Path) -> Verdict:
+        """The aggregate verdict at the given test group.
+        Computes the lexicographically first non-accepted verdict.
+
+        Raises:
+        ValueError when missing child verdicts make the result ill-defined.
+            For instance, [AC, RTE, None] is fine (the result is RTE), but
+            [AC, None, RTE] is not (the first error cannot be determined).
+        """
+        with self:
+            child_verdicts = [self.verdict[c] for c in self.children[test_group]]
+            if all(v == Verdict.ACCEPTED for v in child_verdicts):
+                return Verdict.ACCEPTED
+            else:
+                first_error = next(v for v in child_verdicts if v != Verdict.ACCEPTED)
+                if first_error in [None, False]:
+                    raise ValueError(
+                        f"Verdict aggregation at {test_group.as_posix()} with unknown child verdicts"
+                    )
+                assert first_error is not None
+                assert first_error is not False
+                return first_error
+
+    def _set_verdict_for_node(self, test_node: Path, verdict: Verdict, timeout: bool) -> None:
+        # This assumes self.lock is already held.
+        if timeout:
+            assert verdict != Verdict.ACCEPTED
+            self.has_timeout = True
+        # Note that `False` verdicts can be overwritten if they were already started before being set to False.
+        if self.verdict[test_node] not in [None, False]:
+            raise ValueError(
+                f"Overwriting verdict of {test_node.as_posix()} to {verdict} (was {self.verdict[test_node]})"
+            )
+        self.verdict[test_node] = verdict
+        if not test_node.parents:
+            return None
+        parent = test_node.parent
+
+        # Possibly mark sibling cases as unneeded.
+        match self.run_until:
+            case RunUntil.FIRST_ERROR:
+                # On error, set all later siblings to False.
+                if verdict != Verdict.ACCEPTED:
+                    for sibling in self.children[parent]:
+                        if sibling > test_node and self.verdict[sibling] is None:
+                            self.verdict[sibling] = False
+
+            case RunUntil.DURATION:
+                # On timeout, set all later siblings to False.
+                if timeout:
+                    for sibling in self.children[parent]:
+                        if sibling > test_node and self.verdict[sibling] is None:
+                            self.verdict[sibling] = False
+
+            case RunUntil.ALL:
+                # Don't skip any cases.
+                pass
+
+        # possibly update verdict at parent and escalate change upward recursively
+        if self.verdict[parent] is None or self.verdict[parent] is False:
+            try:
+                parentverdict = self.aggregate(parent)
+                self._set_verdict_for_node(parent, parentverdict, timeout)
+            except ValueError:
+                # parent verdict cannot be determined yet
+                pass
+
+    def run_is_needed(self, run: "Run") -> bool:
+        """
+        There are 3 modes for running cases:
+        - default: run until the lexicographically first error is known
+        - duration: run until the slowest case is known
+        - all: run all cases
+
+        Test cases/groups have their verdict set to `False` as soon as it is determined they are not needed.
+        """
+        with self:
+            if run.skip:
+                return False
+            test_case = run.test_case.short_path
+            if self[test_case] is not None:
+                return False
+
+            match self.run_until:
+                case RunUntil.FIRST_ERROR:
+                    # Run only if parents do not have known verdicts yet.
+                    return all(self.verdict[parent] is None for parent in test_case.parents)
+                case RunUntil.DURATION:
+                    # Run only if not explicitly marked as unneeded.
+                    return all(self.verdict[parent] is not False for parent in test_case.parents)
+                case RunUntil.ALL:
+                    # Run all cases.
+                    return True
+
+
+class VerdictTable:
+    class Group:
+        def __init__(self, length: int, text: str) -> None:
+            self.length = length
+            self.text = text
+
+        def tuple(self) -> tuple[int, str]:
+            return (self.length, self.text)
+
+    def __init__(
+        self,
+        submissions: Sequence["Submission"],
+        test_cases: Sequence[TestCase],
+        width: int = bar.COLUMNS,
+        height: int = shutil.get_terminal_size().lines,
+        max_name_width: int = 50,
+    ) -> None:
+        self.submissions: list[Path] = [s.short_path for s in submissions]
+        self.test_cases: list[Path] = [t.short_path for t in test_cases]
+        self.samples: set[Path] = {t.short_path for t in test_cases if t.root == "sample"}
+        self.results: list[Verdicts] = []
+        self.current_test_cases: set[Path] = set()
+        self.last_printed: list[int] = []
+        self.width: int
+        self.print_updates: bool
+        if config.args.tree:
+            self.width = width if width >= 20 else -1
+            self.print_updates = not config.args.no_bar and config.args.overview
+            self.checked_height: int | bool = height
+        else:
+            self.name_width: int = min(
+                max_name_width,
+                max([len(submission.as_posix()) for submission in self.submissions]),
+            )
+            self.width = width if width >= self.name_width + 2 + 10 else -1
+
+            self.print_updates = not config.args.no_bar and config.args.overview and self.width >= 0
+            if self.print_updates:
+                # generate example lines for one submission
+                name = "x" * self.name_width
+                lines = [f"{Style.DIM}{Fore.CYAN}{name}{Fore.WHITE}:"]
+
+                verdicts = []
+                for t, test_case in enumerate(self.test_cases):
+                    if t % 10 == 0:
+                        verdicts.append(VerdictTable.Group(0, ""))
+                    verdicts[-1].length += 1
+                    verdicts[-1].text += "s" if test_case in self.samples else "-"
+
+                printed = self.name_width + 1
+                for verdict_value in verdicts:
+                    length, tmp = verdict_value.tuple()
+                    if printed + 1 + length > self.width:
+                        lines.append(f"{'':{self.name_width + 1}}")
+                        printed = self.name_width + 1
+                    lines[-1] += f" {tmp}"
+                    printed += length + 1
+
+                # dont print table if it fills too much of the screen
+                self.print_updates = len(lines) * len(self.submissions) + 5 < height
+                if not self.print_updates:
+                    bar.eprint(
+                        f"{Fore.YELLOW}WARNING: Overview too large for terminal, skipping live updates{Style.RESET_ALL}"
+                    )
+                    bar.eprint(
+                        *lines,
+                        f"[times {len(self.submissions)}...]",
+                        Style.RESET_ALL,
+                        sep="\n",
+                        end="\n",
+                    )
+
+    def next_submission(self, verdicts: Verdicts) -> None:
+        self.results.append(verdicts)
+        self.current_test_cases = set()
+
+    def start_run(self, run: "Run") -> None:
+        self.current_test_cases.add(run.test_case.short_path)
+
+    def done_run(self, run: "Run") -> None:
+        self.results[-1].update(run)
+        self.current_test_cases.discard(run.test_case.short_path)
+
+    def _clear(self) -> None:
+        if self.last_printed:
+            actual_width = bar.COLUMNS
+            lines = sum(
+                max(1, (printed + actual_width - 1) // actual_width)
+                for printed in self.last_printed
+            )
+
+            bar.eprint("\033[K\033[A" * (lines - 1), end="\r", flush=False)
+            self.last_printed = []
+
+    def _get_verdict(self, s: int, test_case: Path, check_sample: bool = True) -> str:
+        res = f"{Style.DIM}-{Style.RESET_ALL}"
+        if s < len(self.results) and self.results[s][test_case] not in [None, False]:
+            lower = check_sample and test_case in self.samples
+            res = to_char(self.results[s][test_case], lower=lower)
+        elif s + 1 == len(self.results) and test_case in self.current_test_cases:
+            res = Style.DIM + to_char(None)
+        return res
+
+    def print(self, **kwargs: Any) -> None:
+        if config.args.tree:
+            self._print_tree(**kwargs)
+        else:
+            self._print_table(**kwargs)
+
+    def _print_tree(
+        self,
+        *,
+        update: bool = False,
+        new_lines: int = 1,
+        printed_lengths: Optional[list[int]] = None,
+    ) -> None:
+        if printed_lengths is None:
+            printed_lengths = []
+        if not update or self.print_updates:
+            printed_text = ["\n\033[2K" * new_lines]
+            printed_lengths += [0] * new_lines
+
+            max_depth = config.args.depth
+            show_root = False
+            root = Path()
+
+            stack = [(root, "", "", True)]
+            while stack:
+                node, indent, prefix, last = stack.pop()
+                if node != root or show_root:
+                    name = node.name
+                    verdict = self.results[-1][node]
+                    verdict_str = (
+                        to_string(verdict)
+                        if verdict is not False
+                        else f"{Style.DIM}-{Style.RESET_ALL}"
+                    )
+                    verdict_len = 1 if verdict in [None, False] else len(str(verdict))
+                    printed_text.append(
+                        f"{Style.DIM}{indent}{prefix}{Style.RESET_ALL}{name}: {verdict_str}\n\033[K"
+                    )
+                    printed_lengths.append(len(indent) + len(prefix) + len(name) + 2 + verdict_len)
+                if max_depth is not None and len(indent) >= 2 * max_depth:
+                    continue
+                pipe = " " if last else "│"
+                first = True
+                verdicts = []
+                for child in reversed(self.results[-1].children[node]):
+                    if self.results[-1]._is_test_group(child):
+                        if first:
+                            stack.append((child, f"{indent}{pipe} ", "└╴", True))
+                            first = False
+                        else:
+                            stack.append((child, f"{indent}{pipe} ", "├╴", False))
+                    else:
+                        verdicts.append(self._get_verdict(len(self.results) - 1, child, False))
+                if verdicts:
+                    verdicts.reverse()
+                    edge = "└" if first else "├"
+                    pipe2 = " " if first else "│"
+
+                    grouped = []
+                    for i, v in enumerate(verdicts):
+                        if i % 10 == 0:
+                            grouped.append(VerdictTable.Group(0, ""))
+                        grouped[-1].length += 1
+                        grouped[-1].text += v
+
+                    printed_text.append(f"{Style.DIM}{indent}{pipe} {edge}╴{Style.RESET_ALL}")
+                    pref_len = len(indent) + len(pipe) + 1 + len(edge) + 1
+                    printed = pref_len
+
+                    width = -1 if bar.COLUMNS - pref_len < 10 else self.width
+                    space = ""
+
+                    for grouped_value in grouped:
+                        length, group = grouped_value.tuple()
+                        if width >= 0 and printed + 1 + length > width:
+                            printed_text.append(
+                                f"\n\033[K{Style.DIM}{indent}{pipe} {pipe2} {Style.RESET_ALL}"
+                            )
+                            printed_lengths.append(printed)
+                            printed = pref_len
+                            space = ""
+
+                        printed_text.append(f"{space}{group}")
+                        printed += length + len(space)
+                        space = " "
+
+                    printed_lengths.append(printed)
+                    printed_text.append("\n\033[K")
+
+            self._clear()
+
+            if self.checked_height is not True:
+                height = sum((w + bar.COLUMNS - 1) // bar.COLUMNS for w in printed_lengths)
+                if self.checked_height < height + 5:
+                    bar.eprint(
+                        f"\033[0J{Fore.YELLOW}WARNING: Overview too large for terminal, skipping live updates{Style.RESET_ALL}\n",
+                    )
+                    self.print_updates = False
+                self.checked_height = True
+                if update and not self.print_updates:
+                    return
+
+            bar.eprint(*printed_text, "\033[0J", sep="", end="", flush=not update)
+            self.last_printed = printed_lengths
+
+    def _print_table(
+        self,
+        *,
+        update: bool = False,
+        new_lines: int = 2,
+        printed_lengths: Optional[list[int]] = None,
+    ) -> None:
+        if printed_lengths is None:
+            printed_lengths = []
+        if not update or self.print_updates:
+            printed_text = ["\n\033[2K" * new_lines]
+            printed_lengths += [0] * new_lines
+            for s, submission in enumerate(self.submissions):
+                # pad/truncate submission names to not break table layout
+                name = submission.as_posix()
+                if len(name) > self.name_width:
+                    name = f"...{name[-self.name_width + 3 :]}"
+                padding = " " * (self.name_width - len(name))
+                printed_text.append(f"{Fore.CYAN}{name}{Style.RESET_ALL}:{padding}")
+                printed = self.name_width + 1
+
+                # group verdicts in parts of length at most ten
+                verdicts = []
+                for t, test_case in enumerate(self.test_cases):
+                    if t % 10 == 0:
+                        verdicts.append(VerdictTable.Group(0, ""))
+                    verdicts[-1].length += 1
+                    verdicts[-1].text += self._get_verdict(s, test_case)
+
+                for verdict_value in verdicts:
+                    length, tmp = verdict_value.tuple()
+                    if self.width >= 0 and printed + 1 + length > self.width:
+                        printed_text.append(f"\n\033[K{'':{self.name_width + 1}}")
+                        printed_lengths.append(printed)
+                        printed = self.name_width + 1
+
+                    printed_text.append(f" {tmp}")
+                    printed += length + 1
+
+                printed_lengths.append(printed)
+                printed_text.append("\n\033[K")
+
+            self._clear()
+            bar.eprint(*printed_text, "\033[0J", sep="", end="", flush=not update)
+            self.last_printed = printed_lengths
+
+
+class IOThread:
+    def __init__(self, table: VerdictTable) -> None:
+        self.finalized = False
+        self.dead = False
+        self.table = table
+        self.buffer = list[Callable[[], None]]()
+        self.has_buffered = threading.Event()
+
+        def buffer_printer() -> None:
+            while True:
+                self.has_buffered.wait()
+                with BaseBar.lock:
+                    self.has_buffered.clear()
+                    if self.buffer:
+                        if isinstance(sys.stderr, io.TextIOWrapper):
+                            reset_line_buffering = sys.stderr.line_buffering
+                            sys.stderr.reconfigure(line_buffering=False)
+
+                        # table will call IOThread.print()
+                        BaseBar.lock_depth += 1
+                        tmp, self.buffer = self.buffer, []
+                        self.table._clear()
+                        self.buffer += tmp
+                        self.table.print(update=True, printed_lengths=[bar.COLUMNS])
+                        IOThread._print(end="", flush=True)
+                        BaseBar.lock_depth -= 1
+
+                        for buffered in self.buffer:
+                            buffered()
+                        self.buffer = []
+
+                        if isinstance(sys.stderr, io.TextIOWrapper):
+                            sys.stderr.reconfigure(line_buffering=reset_line_buffering)
+                    if self.finalized:
+                        self.dead = True
+                        break
+                # limit the number of prints per second
+                time.sleep(1 / 60)
+            assert not self.buffer
+
+        self.io_thread = threading.Thread(target=buffer_printer, daemon=True)
+        self.io_thread.start()
+
+    def notify(self) -> None:
+        self.has_buffered.set()
+
+    @staticmethod
+    def _print(*args: Any, **kwargs: Any) -> None:
+        kwargs.setdefault("file", sys.stderr)
+        print(*args, **kwargs)
+
+    def print(self, *args: Any, **kwargs: Any) -> None:
+        with BaseBar.lock:
+            assert not self.dead
+            self.buffer.append(lambda: IOThread._print(*args, **kwargs))
+
+    def finalize(self) -> None:
+        self.finalized = True
+        self.notify()
+        self.io_thread.join()
+
+
+class TableProgressBar(ProgressBar):
+    def __init__(
+        self,
+        table: VerdictTable,
+        prefix: str,
+        max_len: Optional[int] = None,
+        count: Optional[int] = None,
+        *,
+        items: Optional[Sequence[ItemType]] = None,
+        needs_leading_newline: bool = False,
+    ) -> None:
+        super().__init__(
+            prefix,
+            max_len,
+            count,
+            items=items,
+            needs_leading_newline=needs_leading_newline,
+        )
+        self.table = table
+        self.io = IOThread(table)
+
+    # at the end of all IO, notify the print thread
+    def __exit__(self, *args: Any) -> None:
+        exit = ProgressBar.lock_depth == 1
+        super().__exit__(*args)
+        if exit:
+            self.io.notify()
+
+    @override
+    def eprint(self, *args: Any, **kwargs: Any) -> None:
+        with self:
+            kwargs["flush"] = False  # drop all flushes...
+            self.io.print(*args, **kwargs)
+
+    @override
+    def start(self, item: ItemType = "") -> None:
+        from bapctools.run import Run
+
+        assert isinstance(item, Run)
+        self.table.start_run(item)
+        super().start(item)
+
+    @override
+    def done(
+        self,
+        success: bool = True,
+        message: str = "",
+        data: Optional[str] = None,
+        *,
+        print_item: bool = True,
+        force_log: bool = False,
+    ) -> None:
+        from bapctools.run import Run
+
+        assert isinstance(self.local.item, Run)
+        self.table.done_run(self.local.item)
+        super().done(success, message, data, print_item=print_item, force_log=force_log)
+
+    @override
+    def finalize(
+        self,
+        *,
+        print_done: bool = True,
+        message: Optional[str] = None,
+        suppress_newline: bool = False,
+    ) -> None:
+        super().finalize(
+            print_done=print_done,
+            message=message,
+            suppress_newline=suppress_newline,
+        )
+        self.io.finalize()

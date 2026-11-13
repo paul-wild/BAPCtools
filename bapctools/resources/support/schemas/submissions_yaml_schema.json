@@ -1,0 +1,188 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "Person": {
+            "description": "A person, given either as a string with the full name, optionally followed by an email\nwrapped in <>, such as `Josiah Carberry` or `Josiah Carberry <jcarberry@brown.edu>`, or as a\nmap with the mandatory name and the optional email, orcid, and kattis fields below.",
+            "anyOf": [
+                {
+                    "type": "string"
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "email": {
+                            "type": "string",
+                            "description": "The person's email address, such as `jcarberry@brown.edu`"
+                        },
+                        "kattis": {
+                            "type": "string",
+                            "description": "The person's username on Kattis, such as `jcarberry01`"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "The person's name, such as `Josiah Carberry`"
+                        },
+                        "orcid": {
+                            "type": "string",
+                            "description": "The person's ID in the Open Researcher and Contributor ID system (ORCID), such as `0000-0002-1825-0097`."
+                        }
+                    },
+                    "required": [
+                        "name"
+                    ]
+                }
+            ]
+        },
+        "Persons": {
+            "anyOf": [
+                {
+                    "$ref": "#/$defs/Person"
+                },
+                {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/Person"
+                    },
+                    "prefixItems": [
+                        {
+                            "$ref": "#/$defs/Person"
+                        }
+                    ],
+                    "minItems": 1
+                }
+            ]
+        },
+        "expectation": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "judge_message": {
+                    "type": "string",
+                    "description": "Must appear as a substring in at least one judgemessage.txt."
+                },
+                "permitted": {
+                    "description": "All test cases must have a verdict in this subset.",
+                    "anyOf": [
+                        {
+                            "const": [
+                                "AC",
+                                "WA",
+                                "TLE",
+                                "RTE"
+                            ]
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/$defs/verdict"
+                            },
+                            "prefixItems": [
+                                {
+                                    "$ref": "#/$defs/verdict"
+                                }
+                            ],
+                            "minItems": 1
+                        }
+                    ]
+                },
+                "required": {
+                    "description": "At least one test case must have a verdict in this subset.",
+                    "anyOf": [
+                        {
+                            "const": [
+                                "AC",
+                                "WA",
+                                "TLE",
+                                "RTE"
+                            ]
+                        },
+                        {
+                            "type": "array",
+                            "items": {
+                                "$ref": "#/$defs/verdict"
+                            },
+                            "prefixItems": [
+                                {
+                                    "$ref": "#/$defs/verdict"
+                                }
+                            ],
+                            "minItems": 1
+                        }
+                    ]
+                },
+                "score": {
+                    "description": "The score of the submission equals the given number, or lies in the given inclusive\nrange. Only for scoring problems.",
+                    "anyOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "array",
+                            "prefixItems": [
+                                {
+                                    "type": "number"
+                                },
+                                {
+                                    "type": "number"
+                                }
+                            ],
+                            "maxItems": 2,
+                            "minItems": 2
+                        }
+                    ]
+                },
+                "use_for_time_limit": {
+                    "description": "Opt this (set of) submission(s)into (lower/upper) determining the time\nlimit.",
+                    "enum": [
+                        "lower",
+                        "upper"
+                    ]
+                }
+            }
+        },
+        "submission": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+                "authors": {
+                    "description": "The author(s) of this submission.",
+                    "$ref": "#/$defs/Persons"
+                },
+                "entrypoint": {
+                    "type": "string",
+                    "description": "As specified in the language list, if not given."
+                },
+                "language": {
+                    "type": "string",
+                    "description": "As determined by file endings given in the language list, if not given."
+                },
+                "model_solution": {
+                    "description": "A suggested model solution, suitable to be published.",
+                    "enum": [
+                        false,
+                        true
+                    ]
+                }
+            },
+            "$ref": "#/$defs/expectation"
+        },
+        "verdict": {
+            "enum": [
+                "AC",
+                "WA",
+                "RTE",
+                "TLE"
+            ]
+        }
+    },
+    "type": "object",
+    "description": "JSON-export-only relaxation of ppf.#Submissions's regex-keyed map (glob_path), which\n`cue export --out jsonschema` still can't represent usefully -- it degrades to a bare\n\"additionalProperties: true\". Used only by make_json_schemas.sh, never by cue vet. Lived in\nppf-schemas itself as #SubmissionsJson before v0.1.2; moved here since it's tooling, not\nspec vocabulary.",
+    "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {
+            "$ref": "#/$defs/expectation"
+        },
+        "$ref": "#/$defs/submission"
+    }
+}

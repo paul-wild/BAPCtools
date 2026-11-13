@@ -1,17 +1,17 @@
-import pytest
-import yaml
 from pathlib import Path
-from typing import cast, Any
+from typing import Any, cast
 from unittest.mock import call, MagicMock
 
-import config
-import problem
+import pytest
+import yaml
 
-RUN_DIR = Path.cwd().resolve()
+from bapctools import bar, config, problem
+from bapctools.bar import PrintBar
+from bapctools.util import YamlParser
 
-config.args.verbose = 2
-config.args.error = True
-config.set_default_args()
+RUN_DIR = Path.cwd().absolute()
+
+config.args.add_if_not_set(config.ARGS("test_problem_yaml.py", verbose=2, error=True))
 
 
 # return list of {yaml: {...}, ...} documents
@@ -21,7 +21,7 @@ def read_tests(yaml_name) -> list[dict]:
         if "uuid" in test["yaml"]
         else {**test, "yaml": {**test["yaml"], "uuid": "00000000-0000-0000-0000-000000000000"}}
         for test in yaml.load_all(
-            (RUN_DIR / f"test/yaml/problem/{yaml_name}.yaml").read_text(),
+            (RUN_DIR / f"test/yaml/problem/bapctools/{yaml_name}.yaml").read_text(),
             Loader=yaml.SafeLoader,
         )
     ]
@@ -54,30 +54,36 @@ class MockProblem:
 
 
 class TestProblemYaml:
-    @pytest.mark.parametrize("testdata", read_tests("valid"))
-    def test_valid(self, testdata):
+    @pytest.mark.parametrize("test_data", read_tests("valid"))
+    @bar.restore
+    def test_valid(self, test_data):
         config.n_error = 0
         config.n_warn = 0
 
-        p = problem.ProblemSettings(testdata["yaml"], cast(problem.Problem, MockProblem()))
+        bar.use_globally(PrintBar("problem.yaml"))
+        parser = YamlParser(test_data["yaml"])
+        p = problem.ProblemSettings(parser, cast("problem.Problem", MockProblem()))
         assert config.n_error == 0 and config.n_warn == 0, (
             f"Expected zero errors and warnings, got {config.n_error} and {config.n_warn}"
         )
-        if "eq" in testdata:
-            assert_equal(p, testdata["eq"])
+        if "eq" in test_data:
+            assert_equal(p, test_data["eq"])
 
-    @pytest.mark.parametrize("testdata", read_tests("invalid"))
-    def test_invalid(self, monkeypatch, testdata):
+    @pytest.mark.parametrize("test_data", read_tests("invalid"))
+    @bar.restore
+    def test_invalid(self, monkeypatch, test_data):
         config.n_error = 0
         config.n_warn = 0
 
         fatal = MagicMock(name="fatal", side_effect=SystemExit(-42))
         error = MagicMock(name="error")
         warn = MagicMock(name="warn")
-        for module in ["problem", "util"]:
-            monkeypatch.setattr(f"{module}.fatal", fatal)
-            monkeypatch.setattr(f"{module}.error", error)
-            monkeypatch.setattr(f"{module}.warn", warn)
+
+        monkeypatch.setattr(PrintBar, "fatal", fatal)
+        monkeypatch.setattr(PrintBar, "error", error)
+        monkeypatch.setattr(PrintBar, "warn", warn)
+
+        bar.use_globally(PrintBar("problem.yaml"))
 
         # Still expecting no change, because we're mocking the functions that increment these values
         assert config.n_error == 0 and config.n_warn == 0, (
@@ -85,16 +91,19 @@ class TestProblemYaml:
         )
 
         try:
-            problem.ProblemSettings(testdata["yaml"], cast(problem.Problem, MockProblem()))
+            parser = YamlParser(test_data["yaml"])
+            problem.ProblemSettings(parser, cast("problem.Problem", MockProblem()))
         except SystemExit as e:
             assert e.code == -42
 
-        assert ([call(testdata["fatal"])] if "fatal" in testdata else []) == fatal.mock_calls
+        assert (
+            [call(test_data["fatal"], None, force=None)] if "fatal" in test_data else []
+        ) == fatal.mock_calls
 
-        if isinstance(testdata.get("error", None), str):
-            testdata["error"] = [testdata["error"]]
-        assert [call(x) for x in testdata.get("error", [])] == error.mock_calls
+        if isinstance(test_data.get("error", None), str):
+            test_data["error"] = [test_data["error"]]
+        assert [call(x, None) for x in test_data.get("error", [])] == error.mock_calls
 
-        if isinstance(testdata.get("warn", None), str):
-            testdata["warn"] = [testdata["warn"]]
-        assert [call(x) for x in testdata.get("warn", [])] == warn.mock_calls
+        if isinstance(test_data.get("warn", None), str):
+            test_data["warn"] = [test_data["warn"]]
+        assert [call(x, None) for x in test_data.get("warn", [])] == warn.mock_calls

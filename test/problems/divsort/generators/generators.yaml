@@ -6,23 +6,22 @@ data:
           in: 9.0 3.0 ab cd
           ans: 3.0 abcd
   secret:
-    testdata.yaml:
+    test_group.yaml:
       input_validator_args:
-        integers: small
+        integers: [small]
     data:
       integers:
-        testdata.yaml:
-          input_validator_args:
-            --integer
+        test_group.yaml:
+          input_validator_args: [--integer]
             #grading: foo
         data:
           - unsorted-integer:
               in: 10.0 2.0 ba cd
               ans: 5.0 abcd
       sorted:
-        testdata.yaml:
+        test_group.yaml:
           input_validator_args:
-            strings: --sorted
+            strings: [--sorted]
         data:
           - sorted-integer:
               in: 10.0 1.0 ab cd
@@ -30,47 +29,49 @@ data:
       general:
         data:
           nested_1:
-            testdata.yaml:
-              input_validator_args: --small
+            test_group.yaml:
+              input_validator_args: [--small]
             data:
               small_floats:
                 in: 10 3.5 ab cd
           nested_2:
-            testdata.yaml:
+            test_group.yaml:
               input_validator_args:
-                integers: "" # hides the input_validator_args in secret/testdata.yaml
+                integers: [] # hides the input_validator_args in secret/test_group.yaml
             data:
               - tiny_floats:
                   in: 10.0 3.5 ab dc
               - large_integers:
                   in: 102.0 2.0 ab cd
-                  desc: Must validate, because `secret/testdata.yaml` hidden by `secret/general/nested_2/testdata.yaml`
+                  yaml:
+                    description: Must validate, because `secret/general/nested_2/test_group.yaml` shadows `secret/test_group.yaml`
       tolerant:
-        testdata.yaml:
-          output_validator_args: float_tolerance 1e-2
+        test_group.yaml:
+          output_validator_args: [float_tolerance, "1e-2"]
         data:
           - tiny_floats:
               in: 10.0 3.0 ab dc
               ans: 3.33 abcd
-              desc: |
-                Must be AC. Compare invalid_output/imprecise, which is (there)
-                invalid because of float_tolerance
+              yaml:
+                description: |
+                  Must be AC. Compare invalid_output/imprecise, which is (there)
+                  invalid because of float_tolerance
 
   invalid_input:
     data:
       always_invalid:
         data:
-          too_many_tokens: { in: 10.0 2.5 ab cd ef }
+          too_many_tokens: {in: 10.0 2.5 ab cd ef}
       integers:
-        testdata.yaml:
-          input_validator_args: --integer
+        test_group.yaml:
+          input_validator_args: [--integer]
         data:
-          ints_expected: { in: 10.0 2.5 ab cd }
+          ints_expected: {in: 10.0 2.5 ab cd}
         include:
           - small_floats
       sorted:
-        testdata.yaml:
-          input_validator_args: --sorted
+        test_group.yaml:
+          input_validator_args: [--sorted]
         include:
           - unsorted # invalid here because of --sorted flag (valid input in invalid_answers/no_output_validator_args)
   invalid_answer:
@@ -83,9 +84,9 @@ data:
           unsorted:
             in: 10.0 2.0 cba cd
             ans: 5.0 Abccd
-      with_output_validator_args:
-        testdata.yaml:
-          output_validator_args: --forbid_abcd
+      with_answer_validator_args:
+        test_group.yaml:
+          answer_validator_args: [--forbid_abcd]
         include:
           - imprecise # must reject because its ans includes abcd
   invalid_output:
@@ -95,6 +96,8 @@ data:
         ans: 3.333333333 abcd
         out: 3.33 abcd
   valid_output:
+    test_group.yaml:
+      output_validator_args: [float_tolerance, "1e-2"]
     data:
       valid:
         in: 10.0 3.0 ab cd
